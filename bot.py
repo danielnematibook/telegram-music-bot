@@ -6,7 +6,8 @@ import logging
 import subprocess
 import time
 from collections import defaultdict
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.filters import Command
@@ -34,15 +35,12 @@ if FFMPEG_PATH is None:
 logger.info(f"FFmpeg at {FFMPEG_PATH}")
 
 # ------------------------- Rate Limiting -------------------------
-# ساختار ذخیره درخواست‌ها: {user_id: [timestamp1, timestamp2, ...]}
 request_history = defaultdict(list)
-RATE_LIMIT = 5  # تعداد مجاز در دقیقه
-RATE_WINDOW = 60  # ثانیه
+RATE_LIMIT = 5      # حداکثر فایل در دقیقه
+RATE_WINDOW = 60
 
 def check_rate_limit(user_id: int) -> bool:
-    """بررسی محدودیت نرخ درخواست. برگرداندن True اگر مجاز باشد."""
     now = time.time()
-    # پاک کردن درخواست‌های قدیمی‌تر از یک دقیقه
     request_history[user_id] = [t for t in request_history[user_id] if now - t < RATE_WINDOW]
     if len(request_history[user_id]) >= RATE_LIMIT:
         return False
@@ -55,7 +53,7 @@ def get_rate_limit_message(lang: str) -> str:
     else:
         return f"⏳ You have exceeded the rate limit ({RATE_LIMIT} files per minute). Please wait a moment."
 
-# ------------------------- Database -------------------------
+# ------------------------- Database (only users) -------------------------
 def init_db():
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
@@ -64,15 +62,7 @@ def init_db():
         user_id INTEGER PRIMARY KEY,
         lang TEXT DEFAULT 'en',
         quality TEXT DEFAULT 'medium',
-        mono_mode INTEGER DEFAULT 0   -- 0: stereo, 1: mono
-    )
-    """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS files (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        file_path TEXT,
-        expire_at TEXT
+        mono_mode INTEGER DEFAULT 0
     )
     """)
     conn.commit()
@@ -110,6 +100,10 @@ def get_text(lang, key, **kwargs):
                   "/about - About bot\n"
                   "/help - Help"
         },
+        "queued": {
+            "fa": "⏳ درخواست شما در صف قرار گرفت. لطفاً منتظر بمانید...",
+            "en": "⏳ Your request has been queued. Please wait..."
+        },
         "processing": {"fa": "⏳ در حال پردازش... لطفاً صبر کنید", "en": "⏳ Processing... Please wait"},
         "done": {"fa": "✅ فشرده‌سازی انجام شد\n📉 کاهش حجم: {percent:.1f}%", "en": "✅ Done\n📉 Reduction: {percent:.1f}%"},
         "error": {"fa": "❌ خطا در پردازش", "en": "❌ Error"},
@@ -123,19 +117,19 @@ def get_text(lang, key, **kwargs):
             "en": "Current mode: {mode}"
         },
         "about": {
-            "fa": "🤖 ربات فشرده‌ساز موزیک\nنسخه 2.1\n\n"
+            "fa": "🤖 ربات فشرده‌ساز موزیک\nنسخه 2.2\n\n"
                   "قابلیت‌ها:\n"
                   "• فشرده‌سازی فایل‌های صوتی\n"
                   "• استخراج صدا از ویدیو و فشرده‌سازی\n"
                   "• تبدیل استریو به مونو\n"
-                  "• محدودیت نرخ درخواست\n\n"
+                  "• صف پردازش (مدیریت همزمان)\n\n"
                   "ساخته شده با aiogram 3 و FFmpeg",
-            "en": "🤖 Music Compressor Bot\nVersion 2.1\n\n"
+            "en": "🤖 Music Compressor Bot\nVersion 2.2\n\n"
                   "Features:\n"
                   "• Compress audio files\n"
                   "• Extract audio from video and compress\n"
                   "• Stereo to mono conversion\n"
-                  "• Rate limiting\n\n"
+                  "• Processing queue\n\n"
                   "Built with aiogram 3 and FFmpeg"
         },
         "help": {
@@ -148,8 +142,8 @@ def get_text(lang, key, **kwargs):
                   "   از دستور /quality برای تنظیم کیفیت فشرده‌سازی استفاده کنید.\n\n"
                   "4️⃣ **تبدیل به مونو:**\n"
                   "   از دستور /mono برای کاهش حجم بیشتر (مناسب پادکست و کتاب صوتی) استفاده کنید.\n\n"
-                  "⏱️ فایل‌ها به مدت ۲۴ ساعت در سرور نگهداری می‌شوند.\n"
-                  f"⏳ محدودیت: {RATE_LIMIT} فایل در دقیقه",
+                  f"⏳ محدودیت نرخ درخواست: {RATE_LIMIT} فایل در دقیقه\n"
+                  "🔄 صف پردازش خودکار برای مدیریت همزمان درخواست‌ها",
             "en": "📖 **Help:**\n\n"
                   "1️⃣ **Audio File:**\n"
                   "   Send an audio file (mp3, m4a, ogg, wav), the bot will compress it.\n\n"
@@ -159,13 +153,14 @@ def get_text(lang, key, **kwargs):
                   "   Use /quality command to set compression quality.\n\n"
                   "4️⃣ **Mono Mode:**\n"
                   "   Use /mono command to reduce file size further (ideal for podcasts and audiobooks).\n\n"
-                  "⏱️ Files are kept on server for 24 hours.\n"
-                  f"⏳ Rate limit: {RATE_LIMIT} files per minute"
+                  f"⏳ Rate limit: {RATE_LIMIT} files per minute\n"
+                  "🔄 Auto queue for concurrent requests"
         }
     }
     txt = texts.get(key, {}).get(lang, texts.get(key, {}).get("en", "Processing error"))
     return txt.format(**kwargs) if kwargs else txt
 
+# ------------------------- Keyboards -------------------------
 def main_kb(lang):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🇮🇷 فارسی", callback_data="fa"),
@@ -185,7 +180,6 @@ def quality_kb(lang, current):
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def mono_kb(lang, current_mono):
-    # current_mono: 0 for stereo, 1 for mono
     stereo_text = "✅ استریو (Stereo)" if current_mono == 0 else "استریو (Stereo)"
     mono_text = "✅ مونو (Mono)" if current_mono == 1 else "مونو (Mono)"
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -194,6 +188,7 @@ def mono_kb(lang, current_mono):
         [InlineKeyboardButton(text="🔙 بازگشت" if lang == "fa" else "🔙 Back", callback_data="back")]
     ])
 
+# ------------------------- FFmpeg helpers -------------------------
 async def run_ffmpeg(cmd, step_name=""):
     process = await asyncio.create_subprocess_exec(
         *cmd,
@@ -211,13 +206,111 @@ async def extract_audio_from_video(video_path, audio_path):
     return await run_ffmpeg(cmd, "extract_audio")
 
 async def compress_audio_async(input_path, output_path, bitrate, mono_mode):
-    """فشرده‌سازی با قابلیت تبدیل به مونو"""
     cmd = [FFMPEG_PATH, "-i", input_path, "-b:a", bitrate, "-y"]
     if mono_mode == 1:
-        cmd.extend(["-ac", "1"])  # تبدیل به مونو (1 کانال)
+        cmd.extend(["-ac", "1"])
     cmd.append(output_path)
     return await run_ffmpeg(cmd, "compress_audio")
 
+# ------------------------- Processing Queue -------------------------
+@dataclass
+class QueueItem:
+    user_id: int
+    lang: str
+    file_id: str
+    quality: str
+    mono_mode: int
+    is_video: bool
+    ext: str
+    reply_to_message_id: int = None   # برای پاسخ به پیام اصلی
+
+processing_queue = asyncio.Queue()
+WORKERS_COUNT = 3   # تعداد کارگرهای همزمان
+
+async def queue_worker():
+    """کارگری که از صف می‌خواند و فایل را پردازش می‌کند"""
+    while True:
+        item: QueueItem = await processing_queue.get()
+        try:
+            await process_file(item)
+        except Exception as e:
+            logger.exception(f"Worker error for user {item.user_id}")
+        finally:
+            processing_queue.task_done()
+
+async def process_file(item: QueueItem):
+    """پردازش واقعی فایل (دانلود، استخراج صدا، فشرده‌سازی، ارسال، پاکسازی)"""
+    user_id = item.user_id
+    lang = item.lang
+    file_id = item.file_id
+    quality = item.quality
+    mono_mode = item.mono_mode
+    is_video = item.is_video
+    ext = item.ext
+
+    bitrate = QUALITIES[quality]["bitrate"]
+
+    # پیام وضعیت اولیه (به کاربر می‌گوییم پردازش شروع شد)
+    status_msg = await bot.send_message(user_id, get_text(lang, "processing"))
+
+    input_path = None
+    temp_audio_path = None
+    output_path = None
+
+    try:
+        # دانلود فایل
+        file = await bot.get_file(file_id)
+        input_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_in{ext}")
+        await bot.download_file(file.file_path, input_path)
+        await status_msg.edit_text("⏳ [🟩⬜⬜⬜⬜] 20% - " + ("دانلود شد، در حال آماده‌سازی..." if lang == "fa" else "Downloaded, preparing..."))
+
+        if is_video:
+            temp_audio_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_temp_audio.mp3")
+            await status_msg.edit_text("⏳ [🟩🟩⬜⬜⬜] 40% - " + ("در حال استخراج صدا از ویدیو..." if lang == "fa" else "Extracting audio from video..."))
+            success = await extract_audio_from_video(input_path, temp_audio_path)
+            if not success:
+                raise Exception("Audio extraction failed")
+            audio_for_compress = temp_audio_path
+            await status_msg.edit_text("⏳ [🟩🟩🟩⬜⬜] 60% - " + ("صدا استخراج شد، در حال فشرده‌سازی..." if lang == "fa" else "Audio extracted, compressing..."))
+        else:
+            audio_for_compress = input_path
+            await status_msg.edit_text("⏳ [🟩🟩🟩⬜⬜] 60% - " + ("در حال فشرده‌سازی..." if lang == "fa" else "Compressing..."))
+
+        output_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_out.mp3")
+        success = await compress_audio_async(audio_for_compress, output_path, bitrate, mono_mode)
+        if not success:
+            raise Exception("Compression failed")
+
+        await status_msg.edit_text("⏳ [🟩🟩🟩🟩🟩] 100% - " + ("آماده ارسال..." if lang == "fa" else "Ready to send..."))
+
+        orig_size = os.path.getsize(audio_for_compress) / (1024*1024)
+        new_size = os.path.getsize(output_path) / (1024*1024)
+        percent = (1 - new_size/orig_size) * 100
+
+        # ارسال نتیجه
+        await status_msg.delete()
+        await bot.send_message(user_id, get_text(lang, "done", percent=percent))
+        await bot.send_audio(user_id, FSInputFile(output_path))
+
+        # حذف فایل خروجی از دیسک (بلافاصله بعد از ارسال)
+        if output_path and os.path.exists(output_path):
+            os.remove(output_path)
+            logger.info(f"Deleted output file {output_path}")
+
+    except Exception as e:
+        logger.exception(f"Processing failed for user {user_id}")
+        await status_msg.delete()
+        await bot.send_message(user_id, get_text(lang, "error"))
+    finally:
+        # پاکسازی فایل‌های موقت (ورودی و temp)
+        for f in [input_path, temp_audio_path]:
+            if f and os.path.exists(f):
+                try:
+                    os.remove(f)
+                except:
+                    pass
+
+# ------------------------- Bot Handlers -------------------------
 @dp.message(Command("start"))
 async def start(msg: types.Message):
     user_id = msg.from_user.id
@@ -363,102 +456,56 @@ async def handle_media(msg: types.Message):
     if not (is_audio or is_video or is_document_audio or is_document_video):
         return
 
+    # دریافت تنظیمات کاربر از دیتابیس
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
     cur.execute("SELECT quality, mono_mode FROM users WHERE user_id = ?", (user_id,))
     quality, mono_mode = cur.fetchone()
     conn.close()
-    bitrate = QUALITIES[quality]["bitrate"]
 
-    progress_msg = await msg.answer(get_text(lang, "processing"))
+    # تعیین file_id و نوع
+    if is_audio:
+        file_id = msg.audio.file_id
+        is_video_flag = False
+        ext = ".mp3"
+    elif is_document_audio:
+        file_id = msg.document.file_id
+        is_video_flag = False
+        ext = os.path.splitext(msg.document.file_name)[1] or ".mp3"
+    elif is_video:
+        file_id = msg.video.file_id
+        is_video_flag = True
+        ext = ".mp4"
+    else:  # is_document_video
+        file_id = msg.document.file_id
+        is_video_flag = True
+        ext = os.path.splitext(msg.document.file_name)[1] or ".mp4"
 
-    input_path = None
-    output_path = None
-    temp_audio_path = None
+    # ساخت آیتم صف
+    item = QueueItem(
+        user_id=user_id,
+        lang=lang,
+        file_id=file_id,
+        quality=quality,
+        mono_mode=mono_mode,
+        is_video=is_video_flag,
+        ext=ext,
+        reply_to_message_id=msg.message_id
+    )
 
-    try:
-        if is_audio:
-            file_id = msg.audio.file_id
-            ext = ".mp3"
-        elif is_document_audio:
-            file_id = msg.document.file_id
-            ext = os.path.splitext(msg.document.file_name)[1] or ".mp3"
-        elif is_video:
-            file_id = msg.video.file_id
-            ext = ".mp4"
-        else:  # is_document_video
-            file_id = msg.document.file_id
-            ext = os.path.splitext(msg.document.file_name)[1] or ".mp4"
+    # اضافه کردن به صف و اعلام به کاربر
+    await processing_queue.put(item)
+    await msg.answer(get_text(lang, "queued"))
 
-        file = await bot.get_file(file_id)
-        input_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_in{ext}")
-        await bot.download_file(file.file_path, input_path)
-
-        await progress_msg.edit_text("⏳ [🟩⬜⬜⬜⬜] 20% - " + ("دانلود شد، در حال آماده‌سازی..." if lang == "fa" else "Downloaded, preparing..."))
-
-        if is_video or is_document_video:
-            temp_audio_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_temp_audio.mp3")
-            await progress_msg.edit_text("⏳ [🟩🟩⬜⬜⬜] 40% - " + ("در حال استخراج صدا از ویدیو..." if lang == "fa" else "Extracting audio from video..."))
-            success = await extract_audio_from_video(input_path, temp_audio_path)
-            if not success:
-                raise Exception("Audio extraction failed")
-            audio_for_compress = temp_audio_path
-            await progress_msg.edit_text("⏳ [🟩🟩🟩⬜⬜] 60% - " + ("صدا استخراج شد، در حال فشرده‌سازی..." if lang == "fa" else "Audio extracted, compressing..."))
-        else:
-            audio_for_compress = input_path
-            await progress_msg.edit_text("⏳ [🟩🟩🟩⬜⬜] 60% - " + ("در حال فشرده‌سازی..." if lang == "fa" else "Compressing..."))
-
-        output_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_out.mp3")
-        success = await compress_audio_async(audio_for_compress, output_path, bitrate, mono_mode)
-        if not success:
-            raise Exception("Compression failed")
-
-        await progress_msg.edit_text("⏳ [🟩🟩🟩🟩🟩] 100% - " + ("آماده ارسال..." if lang == "fa" else "Ready to send..."))
-
-        orig_size = os.path.getsize(audio_for_compress) / (1024*1024)
-        new_size = os.path.getsize(output_path) / (1024*1024)
-        percent = (1 - new_size/orig_size) * 100
-
-        expire = datetime.now() + timedelta(days=1)
-        conn = sqlite3.connect(DB)
-        cur = conn.cursor()
-        cur.execute("INSERT INTO files (user_id, file_path, expire_at) VALUES (?, ?, ?)", (user_id, output_path, expire.isoformat()))
-        conn.commit()
-        conn.close()
-
-        await progress_msg.delete()
-        await msg.answer(get_text(lang, "done", percent=percent))
-        await msg.answer_audio(FSInputFile(output_path))
-
-    except Exception as e:
-        logger.exception("Error in handle_media")
-        await progress_msg.delete()
-        await msg.answer(get_text(lang, "error"))
-    finally:
-        for f in [input_path, temp_audio_path, output_path]:
-            if f and os.path.exists(f):
-                try:
-                    os.remove(f)
-                except:
-                    pass
-
-async def cleanup():
-    while True:
-        conn = sqlite3.connect(DB)
-        cur = conn.cursor()
-        now = datetime.now().isoformat()
-        cur.execute("SELECT id, file_path FROM files WHERE expire_at < ?", (now,))
-        for rid, path in cur.fetchall():
-            if os.path.exists(path):
-                os.remove(path)
-            cur.execute("DELETE FROM files WHERE id = ?", (rid,))
-        conn.commit()
-        conn.close()
-        await asyncio.sleep(3600)
-
+# ------------------------- Main -------------------------
 async def main():
-    asyncio.create_task(cleanup())
+    # راه‌اندازی کارگرهای صف
+    workers = [asyncio.create_task(queue_worker()) for _ in range(WORKERS_COUNT)]
+    # شروع polling ربات
     await dp.start_polling(bot)
+    # در حالت عادی هیچ‌گاه به اینجا نمی‌رسد، اما برای خوش‌دستی:
+    for w in workers:
+        w.cancel()
 
 if __name__ == "__main__":
     asyncio.run(main())
