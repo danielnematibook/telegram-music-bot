@@ -65,13 +65,25 @@ QUALITIES = {
 def get_text(lang, key, **kwargs):
     texts = {
         "start": {
-            "fa": "🎵 به ربات فشرده‌ساز موزیک خوش آمدید.\nیک فایل صوتی ارسال کنید تا فشرده شود.\n\nدستورات:\n/quality - تنظیم کیفیت",
-            "en": "🎵 Welcome to Music Compressor.\nSend an audio file to compress.\n\nCommands:\n/quality - Set quality"
+            "fa": "🎵 به ربات فشرده‌ساز موزیک خوش آمدید.\nیک فایل صوتی یا تصویری ارسال کنید تا فشرده شود.\n\nدستورات:\n/quality - تنظیم کیفیت",
+            "en": "🎵 Welcome to Music Compressor.\nSend an audio or video file to compress.\n\nCommands:\n/quality - Set quality"
         },
-        "processing": {"fa": "⏳ در حال پردازش... لطفاً صبر کنید", "en": "⏳ Processing... Please wait"},
-        "done": {"fa": "✅ فشرده‌سازی انجام شد\n📉 کاهش حجم: {percent:.1f}%", "en": "✅ Done\n📉 Reduction: {percent:.1f}%"},
-        "error": {"fa": "❌ خطا در پردازش", "en": "❌ Error"},
-        "quality_set": {"fa": "کیفیت به {name} تغییر کرد", "en": "Quality set to {name}"}
+        "processing": {
+            "fa": "⏳ در حال پردازش... لطفاً صبر کنید",
+            "en": "⏳ Processing... Please wait"
+        },
+        "done": {
+            "fa": "✅ فشرده‌سازی انجام شد\n📉 کاهش حجم: {percent:.1f}%",
+            "en": "✅ Done\n📉 Reduction: {percent:.1f}%"
+        },
+        "error": {
+            "fa": "❌ خطا در پردازش",
+            "en": "❌ Error"
+        },
+        "quality_set": {
+            "fa": "کیفیت به {name} تغییر کرد",
+            "en": "Quality set to {name}"
+        }
     }
     txt = texts[key][lang]
     return txt.format(**kwargs) if kwargs else txt
@@ -93,8 +105,8 @@ def quality_kb(lang, current):
     buttons.append([InlineKeyboardButton(text="🔙 بازگشت" if lang == "fa" else "🔙 Back", callback_data="back")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-async def compress_audio_async(input_path, output_path, bitrate):
-    cmd = [FFMPEG_PATH, "-i", input_path, "-b:a", bitrate, "-y", output_path]
+async def run_ffmpeg(cmd, step_name=""):
+    """اجرای دستور ffmpeg و برگرداندن نتیجه موفقیت/شکست"""
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=subprocess.PIPE,
@@ -102,9 +114,19 @@ async def compress_audio_async(input_path, output_path, bitrate):
     )
     _, stderr = await process.communicate()
     if process.returncode != 0:
-        logger.error(f"FFmpeg error: {stderr.decode()}")
+        logger.error(f"FFmpeg error in {step_name}: {stderr.decode()}")
         return False
     return True
+
+async def extract_audio_from_video(video_path, audio_path):
+    """استخراج صدا از ویدیو (تبدیل به mp3 با کیفیت اصلی)"""
+    cmd = [FFMPEG_PATH, "-i", video_path, "-q:a", "0", "-map", "a", audio_path, "-y"]
+    return await run_ffmpeg(cmd, "extract_audio")
+
+async def compress_audio_async(input_path, output_path, bitrate):
+    """فشرده‌سازی فایل صوتی با نرخ بیت مشخص"""
+    cmd = [FFMPEG_PATH, "-i", input_path, "-b:a", bitrate, "-y", output_path]
+    return await run_ffmpeg(cmd, "compress_audio")
 
 @dp.message(Command("start"))
 async def start(msg: types.Message):
@@ -170,7 +192,6 @@ async def callback(call: types.CallbackQuery):
         await call.message.edit_text(get_text(lang, "start"), reply_markup=main_kb(lang))
 
     elif data == "donate":
-        # متن دونیت بر اساس زبان کاربر
         if lang == "fa":
             donate_text = (
                 "💖 این ربات به رایگان در اختیار شما قرار گرفته است اما برای بقای این پروژه می‌توانید از ما حمایت مالی کنید:\n\n"
@@ -195,9 +216,17 @@ async def callback(call: types.CallbackQuery):
     await call.answer()
 
 @dp.message()
-async def handle_audio(msg: types.Message):
-    if not (msg.audio or (msg.document and msg.document.mime_type and msg.document.mime_type.startswith('audio/'))):
+async def handle_media(msg: types.Message):
+    """پردازش فایل صوتی یا ویدیویی"""
+    # تشخیص نوع رسانه
+    is_audio = msg.audio is not None
+    is_video = msg.video is not None
+    is_document_audio = (msg.document and msg.document.mime_type and msg.document.mime_type.startswith('audio/'))
+    is_document_video = (msg.document and msg.document.mime_type and msg.document.mime_type.startswith('video/'))
+
+    if not (is_audio or is_video or is_document_audio or is_document_video):
         return
+
     user_id = msg.from_user.id
     lang = user_lang.get(user_id, "en")
     conn = sqlite3.connect(DB)
@@ -207,39 +236,90 @@ async def handle_audio(msg: types.Message):
     conn.close()
     bitrate = QUALITIES[quality]["bitrate"]
 
-    status_msg = await msg.answer(get_text(lang, "processing"))
+    # پیام پیشرفت (نوار پیشرفت تقریبی)
+    progress_msg = await msg.answer("⏳ [⬜⬜⬜⬜⬜] 0% - " + ("در حال دانلود..." if lang == "fa" else "Downloading..."))
 
-    input_file = f"{DOWNLOAD_DIR}/{user_id}_in.mp3"
-    output_file = f"{DOWNLOAD_DIR}/{user_id}_out.mp3"
+    input_path = None
+    output_path = None
+    temp_audio_path = None  # برای فایل ویدیویی: صدا استخراج شده موقت
+
     try:
-        file_id = msg.audio.file_id if msg.audio else msg.document.file_id
+        # تعیین فایل ورودی
+        if is_audio:
+            file_id = msg.audio.file_id
+            ext = ".mp3"
+        elif is_document_audio:
+            file_id = msg.document.file_id
+            ext = os.path.splitext(msg.document.file_name)[1] or ".mp3"
+        elif is_video:
+            file_id = msg.video.file_id
+            ext = ".mp4"
+        else:  # is_document_video
+            file_id = msg.document.file_id
+            ext = os.path.splitext(msg.document.file_name)[1] or ".mp4"
+
+        # دانلود فایل
         file = await bot.get_file(file_id)
-        await bot.download_file(file.file_path, input_file)
-        orig_size = os.path.getsize(input_file) / (1024*1024)
-        success = await compress_audio_async(input_file, output_file, bitrate)
+        input_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_in{ext}")
+        await bot.download_file(file.file_path, input_path)
+
+        # مرحله 1: دانلود کامل شد
+        await progress_msg.edit_text("⏳ [🟩⬜⬜⬜⬜] 20% - " + ("دانلود شد، در حال آماده‌سازی..." if lang == "fa" else "Downloaded, preparing..."))
+
+        # اگر ویدیو بود، صدا را استخراج کن
+        if is_video or is_document_video:
+            temp_audio_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_temp_audio.mp3")
+            await progress_msg.edit_text("⏳ [🟩🟩⬜⬜⬜] 40% - " + ("در حال استخراج صدا از ویدیو..." if lang == "fa" else "Extracting audio from video..."))
+            success = await extract_audio_from_video(input_path, temp_audio_path)
+            if not success:
+                raise Exception("Audio extraction failed")
+            # فایل ورودی برای فشرده‌سازی، فایل صوتی استخراج شده است
+            audio_for_compress = temp_audio_path
+            await progress_msg.edit_text("⏳ [🟩🟩🟩⬜⬜] 60% - " + ("صداستخراج شد، در حال فشرده‌سازی..." if lang == "fa" else "Audio extracted, compressing..."))
+        else:
+            audio_for_compress = input_path
+            await progress_msg.edit_text("⏳ [🟩🟩🟩⬜⬜] 60% - " + ("در حال فشرده‌سازی..." if lang == "fa" else "Compressing..."))
+
+        # فشرده‌سازی
+        output_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_out.mp3")
+        success = await compress_audio_async(audio_for_compress, output_path, bitrate)
         if not success:
-            raise Exception("FFmpeg failed")
-        new_size = os.path.getsize(output_file) / (1024*1024)
+            raise Exception("Compression failed")
+
+        await progress_msg.edit_text("⏳ [🟩🟩🟩🟩🟩] 100% - " + ("آماده ارسال..." if lang == "fa" else "Ready to send..."))
+
+        # محاسبه حجم و درصد کاهش
+        orig_size = os.path.getsize(audio_for_compress) / (1024*1024)
+        new_size = os.path.getsize(output_path) / (1024*1024)
         percent = (1 - new_size/orig_size) * 100
 
+        # ذخیره در دیتابیس برای پاکسازی بعدی
         expire = datetime.now() + timedelta(days=1)
         conn = sqlite3.connect(DB)
         cur = conn.cursor()
-        cur.execute("INSERT INTO files (user_id, file_path, expire_at) VALUES (?, ?, ?)", (user_id, output_file, expire.isoformat()))
+        cur.execute("INSERT INTO files (user_id, file_path, expire_at) VALUES (?, ?, ?)", (user_id, output_path, expire.isoformat()))
         conn.commit()
         conn.close()
 
-        await status_msg.delete()
+        # حذف پیام پیشرفت
+        await progress_msg.delete()
+
+        # ارسال نتیجه و فایل
         await msg.answer(get_text(lang, "done", percent=percent))
-        await msg.answer_audio(FSInputFile(output_file))
-        os.remove(input_file)
+        await msg.answer_audio(FSInputFile(output_path))
+
     except Exception as e:
-        logger.exception("Error")
-        await status_msg.delete()
+        logger.exception("Error in handle_media")
+        await progress_msg.delete()
         await msg.answer(get_text(lang, "error"))
-        for f in [input_file, output_file]:
-            if os.path.exists(f):
-                os.remove(f)
+    finally:
+        # پاکسازی فایل‌های موقت
+        for f in [input_path, temp_audio_path, output_path]:
+            if f and os.path.exists(f):
+                try:
+                    os.remove(f)
+                except:
+                    pass
 
 async def cleanup():
     while True:
