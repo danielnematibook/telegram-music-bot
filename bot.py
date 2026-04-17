@@ -11,7 +11,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, ChatMemberUpdated
 from aiogram.filters import Command
 from dotenv import load_dotenv
 
@@ -128,7 +128,7 @@ def get_text(lang, key, **kwargs):
             "en": "Current mode: {mode}"
         },
         "about": {
-            "fa": "🤖 ربات فشرده‌ساز موزیک\nنسخه 2.4\n\n"
+            "fa": "🤖 ربات فشرده‌ساز موزیک\nنسخه 2.5\n\n"
                   "قابلیت‌ها:\n"
                   "• فشرده‌سازی فایل‌های صوتی\n"
                   "• استخراج صدا از ویدیو و فشرده‌سازی\n"
@@ -137,7 +137,7 @@ def get_text(lang, key, **kwargs):
                   "• پشتیبانی از گروه‌ها (با ادمین)\n"
                   "• محدودیت حجم فایل: ۷۰ مگابایت\n\n"
                   "ساخته شده با aiogram 3 و FFmpeg",
-            "en": "🤖 Music Compressor Bot\nVersion 2.4\n\n"
+            "en": "🤖 Music Compressor Bot\nVersion 2.5\n\n"
                   "Features:\n"
                   "• Compress audio files\n"
                   "• Extract audio from video and compress\n"
@@ -200,6 +200,22 @@ def get_text(lang, key, **kwargs):
         "file_too_large": {
             "fa": "❌ حجم فایل ارسالی نباید بیشتر از ۷۰ مگابایت باشد.\nحجم فایل شما: {size:.1f} مگابایت",
             "en": "❌ File size cannot exceed 70 MB.\nYour file size: {size:.1f} MB"
+        },
+        "welcome_group": {
+            "fa": "🎉 به گروه خوش آمدید!\n\nربات فشرده‌ساز موزیک با موفقیت به این گروه اضافه شد.\n\n📖 **نحوه استفاده:**\n"
+                  "• یک فایل صوتی یا ویدیویی ارسال کنید.\n"
+                  "• ربات یک دکمه «فشرده‌سازی» نشان می‌دهد.\n"
+                  "• روی آن کلیک کنید تا فایل فشرده شود.\n\n"
+                  "• همچنین می‌توانید روی فایل ریپلی کنید و دستور /compress را بفرستید.\n\n"
+                  "برای اطلاعات بیشتر از دستور /help استفاده کنید.\n\n"
+                  "موفق باشید! 🚀",
+            "en": "🎉 Welcome to the group!\n\nMusic Compressor Bot has been successfully added to this group.\n\n📖 **How to use:**\n"
+                  "• Send an audio or video file.\n"
+                  "• The bot will show a 'Compress' button.\n"
+                  "• Click it to get the compressed file.\n\n"
+                  "• Alternatively, reply to the file with /compress.\n\n"
+                  "Use /help for more information.\n\n"
+                  "Enjoy! 🚀"
         }
     }
     txt = texts.get(key, {}).get(lang, texts.get(key, {}).get("en", "Processing error"))
@@ -393,6 +409,35 @@ async def is_bot_admin(chat_id: int) -> bool:
         return bot_member.status in ["administrator", "creator"]
     except:
         return False
+
+# ------------------------- Auto welcome when bot added to group -------------------------
+# Set to keep track of groups that already received welcome (in memory, resets on restart - acceptable)
+welcomed_groups = set()
+
+@dp.my_chat_member()
+async def on_bot_chat_member_update(update: types.ChatMemberUpdated):
+    # Check if the bot was added to a group or its status changed to admin/member
+    chat = update.chat
+    if chat.type not in ["group", "supergroup"]:
+        return
+    
+    # Check if the bot's status changed to something that allows it to send messages
+    # new_status could be "member", "administrator", or "creator"
+    new_status = update.new_chat_member.status
+    old_status = update.old_chat_member.status
+    
+    # If bot was just added (old_status left, new_status is member/administrator) or upgraded to admin
+    if (old_status in ["left", "kicked"] and new_status in ["member", "administrator", "creator"]) or \
+       (old_status == "member" and new_status == "administrator"):
+        # Avoid sending duplicate welcome message in the same session
+        if chat.id in welcomed_groups:
+            return
+        welcomed_groups.add(chat.id)
+        
+        # Send welcome message in English (or detect group language? We'll use English for simplicity)
+        welcome_text = get_text("en", "welcome_group")
+        await bot.send_message(chat.id, welcome_text, parse_mode="Markdown")
+        logger.info(f"Sent welcome message to group {chat.id}")
 
 # ------------------------- Bot Handlers -------------------------
 @dp.message(Command("start"))
