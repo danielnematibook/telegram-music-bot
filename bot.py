@@ -4,7 +4,7 @@ import sqlite3
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.utils import executor
+from aiogram.filters import Command
 from dotenv import load_dotenv
 import subprocess
 
@@ -13,7 +13,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+dp = Dispatcher()
 
 DB = "database.db"
 DOWNLOAD_DIR = "downloads"
@@ -52,53 +52,52 @@ def get_text(lang, key):
         },
         "donate": {
             "fa": "💖 این بات رایگان است، برای حمایت دونیت کنید\nسازنده: Daniel Nemati",
-            "en": "💖 This bot is free, support us with donation\nCreator: Daniel Nemati"
+            "en": "💖 This bot is free, support us\nCreator: Daniel Nemati"
         }
     }
     return texts[key][lang]
 
 # -------- KEYBOARD --------
 def main_kb():
-    kb = InlineKeyboardMarkup()
-    kb.add(
-        InlineKeyboardButton("🇮🇷 فارسی", callback_data="fa"),
-        InlineKeyboardButton("🇬🇧 English", callback_data="en")
-    )
-    kb.add(InlineKeyboardButton("💖 Donate", callback_data="donate"))
-    return kb
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🇮🇷 فارسی", callback_data="fa"),
+            InlineKeyboardButton(text="🇬🇧 English", callback_data="en")
+        ],
+        [
+            InlineKeyboardButton(text="💖 Donate", callback_data="donate")
+        ]
+    ])
 
 # -------- COMPRESS --------
 def compress_audio(inp, out):
-    subprocess.run([
-        "ffmpeg", "-i", inp,
-        "-b:a", "64k",
-        out
-    ])
+    subprocess.run(["ffmpeg", "-i", inp, "-b:a", "64k", out])
 
 # -------- START --------
-@dp.message_handler(commands=['start'])
+@dp.message(Command("start"))
 async def start(msg: types.Message):
     user_lang[msg.from_user.id] = "en"
     await msg.answer("Select language", reply_markup=main_kb())
 
 # -------- LANGUAGE --------
-@dp.callback_query_handler(lambda c: c.data in ["fa", "en"])
-async def set_lang(call: types.CallbackQuery):
-    user_lang[call.from_user.id] = call.data
-    await call.message.edit_text(
-        get_text(call.data, "start"),
-        reply_markup=main_kb()
-    )
-
-# -------- DONATE --------
-@dp.callback_query_handler(lambda c: c.data == "donate")
-async def donate(call: types.CallbackQuery):
-    lang = user_lang.get(call.from_user.id, "en")
-    await call.answer(get_text(lang, "donate"), show_alert=True)
+@dp.callback_query()
+async def callbacks(call: types.CallbackQuery):
+    if call.data in ["fa", "en"]:
+        user_lang[call.from_user.id] = call.data
+        await call.message.edit_text(
+            get_text(call.data, "start"),
+            reply_markup=main_kb()
+        )
+    elif call.data == "donate":
+        lang = user_lang.get(call.from_user.id, "en")
+        await call.answer(get_text(lang, "donate"), show_alert=True)
 
 # -------- AUDIO --------
-@dp.message_handler(content_types=['audio', 'document'])
+@dp.message()
 async def handle_audio(msg: types.Message):
+    if not (msg.audio or msg.document):
+        return
+
     lang = user_lang.get(msg.from_user.id, "en")
 
     file = await bot.get_file(msg.audio.file_id if msg.audio else msg.document.file_id)
@@ -122,7 +121,7 @@ async def handle_audio(msg: types.Message):
     conn.close()
 
     await msg.answer(get_text(lang, "done"))
-    await msg.answer_audio(open(output_file, "rb"))
+    await msg.answer_audio(types.FSInputFile(output_file))
 
     os.remove(input_file)
 
@@ -146,8 +145,10 @@ async def cleanup():
 
         await asyncio.sleep(3600)
 
-# -------- RUN --------
+# -------- MAIN --------
+async def main():
+    asyncio.create_task(cleanup())
+    await dp.start_polling(bot)
+
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.create_task(cleanup())
-    executor.start_polling(dp, skip_updates=True)
+    asyncio.run(main())
