@@ -5,6 +5,8 @@ import shutil
 import logging
 import subprocess
 import time
+import random
+import string
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -36,7 +38,7 @@ logger.info(f"FFmpeg at {FFMPEG_PATH}")
 
 # ------------------------- Rate Limiting -------------------------
 request_history = defaultdict(list)
-RATE_LIMIT = 5      # حداکثر فایل در دقیقه
+RATE_LIMIT = 5
 RATE_WINDOW = 60
 
 def check_rate_limit(user_id: int) -> bool:
@@ -117,19 +119,21 @@ def get_text(lang, key, **kwargs):
             "en": "Current mode: {mode}"
         },
         "about": {
-            "fa": "🤖 ربات فشرده‌ساز موزیک\nنسخه 2.2\n\n"
+            "fa": "🤖 ربات فشرده‌ساز موزیک\nنسخه 2.3\n\n"
                   "قابلیت‌ها:\n"
                   "• فشرده‌سازی فایل‌های صوتی\n"
                   "• استخراج صدا از ویدیو و فشرده‌سازی\n"
                   "• تبدیل استریو به مونو\n"
-                  "• صف پردازش (مدیریت همزمان)\n\n"
+                  "• صف پردازش (مدیریت همزمان)\n"
+                  "• پشتیبانی از گروه‌ها (با ادمین)\n\n"
                   "ساخته شده با aiogram 3 و FFmpeg",
-            "en": "🤖 Music Compressor Bot\nVersion 2.2\n\n"
+            "en": "🤖 Music Compressor Bot\nVersion 2.3\n\n"
                   "Features:\n"
                   "• Compress audio files\n"
                   "• Extract audio from video and compress\n"
                   "• Stereo to mono conversion\n"
-                  "• Processing queue\n\n"
+                  "• Processing queue\n"
+                  "• Group support (requires admin)\n\n"
                   "Built with aiogram 3 and FFmpeg"
         },
         "help": {
@@ -142,6 +146,8 @@ def get_text(lang, key, **kwargs):
                   "   از دستور /quality برای تنظیم کیفیت فشرده‌سازی استفاده کنید.\n\n"
                   "4️⃣ **تبدیل به مونو:**\n"
                   "   از دستور /mono برای کاهش حجم بیشتر (مناسب پادکست و کتاب صوتی) استفاده کنید.\n\n"
+                  "5️⃣ **استفاده در گروه:**\n"
+                  "   ربات را به گروه اضافه کنید و به او نقش ادمین بدهید. سپس کاربران می‌توانند فایل ارسال کنند و با کلیک روی دکمه «فشرده‌سازی» فایل فشرده را دریافت کنند.\n\n"
                   f"⏳ محدودیت نرخ درخواست: {RATE_LIMIT} فایل در دقیقه\n"
                   "🔄 صف پردازش خودکار برای مدیریت همزمان درخواست‌ها",
             "en": "📖 **Help:**\n\n"
@@ -153,8 +159,30 @@ def get_text(lang, key, **kwargs):
                   "   Use /quality command to set compression quality.\n\n"
                   "4️⃣ **Mono Mode:**\n"
                   "   Use /mono command to reduce file size further (ideal for podcasts and audiobooks).\n\n"
+                  "5️⃣ **Group Usage:**\n"
+                  "   Add bot to group and give it admin rights. Then users can send files and click 'Compress' button to get compressed file.\n\n"
                   f"⏳ Rate limit: {RATE_LIMIT} files per minute\n"
                   "🔄 Auto queue for concurrent requests"
+        },
+        "group_not_admin": {
+            "fa": "⚠️ ربات در این گروه ادمین نیست. لطفاً ابتدا ربات را ادمین کنید تا بتواند فایل‌ها را پردازش کند.",
+            "en": "⚠️ Bot is not admin in this group. Please make bot admin first to process files."
+        },
+        "group_confirm": {
+            "fa": "🎵 فایل صوتی دریافت شد. آیا می‌خواهید آن را فشرده کنید؟",
+            "en": "🎵 Audio file received. Do you want to compress it?"
+        },
+        "group_canceled": {
+            "fa": "❌ عملیات فشرده‌سازی لغو شد.",
+            "en": "❌ Compression canceled."
+        },
+        "group_expired": {
+            "fa": "⏰ زمان درخواست شما منقضی شده است. لطفاً دوباره فایل را ارسال کنید.",
+            "en": "⏰ Your request has expired. Please send the file again."
+        },
+        "group_result": {
+            "fa": "👤 کاربر {name}:\n✅ فشرده‌سازی انجام شد\n📉 کاهش حجم: {percent:.1f}%",
+            "en": "👤 User {name}:\n✅ Compression done\n📉 Reduction: {percent:.1f}%"
         }
     }
     txt = texts.get(key, {}).get(lang, texts.get(key, {}).get("en", "Processing error"))
@@ -187,6 +215,34 @@ def mono_kb(lang, current_mono):
         [InlineKeyboardButton(text=mono_text, callback_data="mono_1")],
         [InlineKeyboardButton(text="🔙 بازگشت" if lang == "fa" else "🔙 Back", callback_data="back")]
     ])
+
+def group_confirm_kb(request_id: str, lang: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ فشرده‌سازی" if lang == "fa" else "✅ Compress", callback_data=f"group_compress_{request_id}"),
+            InlineKeyboardButton(text="❌ انصراف" if lang == "fa" else "❌ Cancel", callback_data=f"group_cancel_{request_id}")
+        ]
+    ])
+
+# ------------------------- Group pending requests -------------------------
+group_pending = {}  # {request_id: {"user_id": int, "chat_id": int, "file_id": str, "is_video": bool, "ext": str, "message_id": int, "timestamp": float, "lang": str}}
+PENDING_EXPIRE_SECONDS = 300  # 5 دقیقه
+
+async def cleanup_pending_requests():
+    while True:
+        now = time.time()
+        expired = [rid for rid, data in group_pending.items() if now - data["timestamp"] > PENDING_EXPIRE_SECONDS]
+        for rid in expired:
+            req = group_pending.pop(rid)
+            try:
+                await bot.edit_message_text(
+                    chat_id=req["chat_id"],
+                    message_id=req["message_id"],
+                    text=get_text(req["lang"], "group_expired")
+                )
+            except:
+                pass
+        await asyncio.sleep(60)  # هر دقیقه چک کن
 
 # ------------------------- FFmpeg helpers -------------------------
 async def run_ffmpeg(cmd, step_name=""):
@@ -222,13 +278,14 @@ class QueueItem:
     mono_mode: int
     is_video: bool
     ext: str
-    reply_to_message_id: int = None   # برای پاسخ به پیام اصلی
+    chat_id: int = None          # برای گروه: آیدی چت
+    reply_to_message_id: int = None
+    requester_name: str = None   # نام کاربر در گروه
 
 processing_queue = asyncio.Queue()
-WORKERS_COUNT = 3   # تعداد کارگرهای همزمان
+WORKERS_COUNT = 3
 
 async def queue_worker():
-    """کارگری که از صف می‌خواند و فایل را پردازش می‌کند"""
     while True:
         item: QueueItem = await processing_queue.get()
         try:
@@ -239,7 +296,6 @@ async def queue_worker():
             processing_queue.task_done()
 
 async def process_file(item: QueueItem):
-    """پردازش واقعی فایل (دانلود، استخراج صدا، فشرده‌سازی، ارسال، پاکسازی)"""
     user_id = item.user_id
     lang = item.lang
     file_id = item.file_id
@@ -247,18 +303,19 @@ async def process_file(item: QueueItem):
     mono_mode = item.mono_mode
     is_video = item.is_video
     ext = item.ext
+    chat_id = item.chat_id or user_id
+    is_group = (chat_id != user_id)
 
     bitrate = QUALITIES[quality]["bitrate"]
 
-    # پیام وضعیت اولیه (به کاربر می‌گوییم پردازش شروع شد)
-    status_msg = await bot.send_message(user_id, get_text(lang, "processing"))
+    # پیام وضعیت
+    status_msg = await bot.send_message(chat_id, get_text(lang, "processing"), reply_to_message_id=item.reply_to_message_id)
 
     input_path = None
     temp_audio_path = None
     output_path = None
 
     try:
-        # دانلود فایل
         file = await bot.get_file(file_id)
         input_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_in{ext}")
         await bot.download_file(file.file_path, input_path)
@@ -287,12 +344,16 @@ async def process_file(item: QueueItem):
         new_size = os.path.getsize(output_path) / (1024*1024)
         percent = (1 - new_size/orig_size) * 100
 
-        # ارسال نتیجه
         await status_msg.delete()
-        await bot.send_message(user_id, get_text(lang, "done", percent=percent))
-        await bot.send_audio(user_id, FSInputFile(output_path))
 
-        # حذف فایل خروجی از دیسک (بلافاصله بعد از ارسال)
+        if is_group and item.requester_name:
+            result_text = get_text(lang, "group_result", name=item.requester_name, percent=percent)
+        else:
+            result_text = get_text(lang, "done", percent=percent)
+
+        await bot.send_message(chat_id, result_text)
+        await bot.send_audio(chat_id, FSInputFile(output_path))
+
         if output_path and os.path.exists(output_path):
             os.remove(output_path)
             logger.info(f"Deleted output file {output_path}")
@@ -300,15 +361,22 @@ async def process_file(item: QueueItem):
     except Exception as e:
         logger.exception(f"Processing failed for user {user_id}")
         await status_msg.delete()
-        await bot.send_message(user_id, get_text(lang, "error"))
+        await bot.send_message(chat_id, get_text(lang, "error"))
     finally:
-        # پاکسازی فایل‌های موقت (ورودی و temp)
         for f in [input_path, temp_audio_path]:
             if f and os.path.exists(f):
                 try:
                     os.remove(f)
                 except:
                     pass
+
+# ------------------------- Helper: check bot admin in group -------------------------
+async def is_bot_admin(chat_id: int) -> bool:
+    try:
+        bot_member = await bot.get_chat_member(chat_id, bot.id)
+        return bot_member.status in ["administrator", "creator"]
+    except:
+        return False
 
 # ------------------------- Bot Handlers -------------------------
 @dp.message(Command("start"))
@@ -372,6 +440,62 @@ async def callback(call: types.CallbackQuery):
     conn.close()
     user_lang[user_id] = lang
 
+    # پردازش دکمه‌های گروه
+    if data.startswith("group_compress_"):
+        request_id = data.split("_")[2]
+        req = group_pending.get(request_id)
+        if not req:
+            await call.answer(get_text(lang, "group_expired"), show_alert=True)
+            await call.message.delete()
+            return
+        if req["user_id"] != user_id:
+            await call.answer("این دکمه متعلق به شما نیست.", show_alert=True)
+            return
+        # حذف از pending
+        group_pending.pop(request_id)
+        # حذف پیام دکمه‌ها
+        await call.message.delete()
+        # دریافت تنظیمات کاربر از دیتابیس (کیفیت و مونو)
+        conn2 = sqlite3.connect(DB)
+        cur2 = conn2.cursor()
+        cur2.execute("SELECT quality, mono_mode FROM users WHERE user_id = ?", (user_id,))
+        user_quality, user_mono = cur2.fetchone()
+        conn2.close()
+        # ساخت آیتم صف
+        item = QueueItem(
+            user_id=user_id,
+            lang=req["lang"],
+            file_id=req["file_id"],
+            quality=user_quality,
+            mono_mode=user_mono,
+            is_video=req["is_video"],
+            ext=req["ext"],
+            chat_id=req["chat_id"],
+            reply_to_message_id=req["message_id"],
+            requester_name=call.from_user.full_name
+        )
+        await processing_queue.put(item)
+        await call.answer("درخواست شما به صف اضافه شد.", show_alert=False)
+        # ارسال پیام به کاربر در گروه که در صف قرار گرفت
+        await bot.send_message(req["chat_id"], get_text(req["lang"], "queued"), reply_to_message_id=req["message_id"])
+        return
+
+    elif data.startswith("group_cancel_"):
+        request_id = data.split("_")[2]
+        req = group_pending.get(request_id)
+        if not req:
+            await call.answer()
+            await call.message.delete()
+            return
+        if req["user_id"] != user_id:
+            await call.answer("این دکمه متعلق به شما نیست.", show_alert=True)
+            return
+        group_pending.pop(request_id)
+        await call.message.edit_text(get_text(req["lang"], "group_canceled"))
+        await call.answer()
+        return
+
+    # دکمه‌های عادی (غیر گروهی)
     if data in ["fa", "en"]:
         conn = sqlite3.connect(DB)
         cur = conn.cursor()
@@ -437,14 +561,43 @@ async def callback(call: types.CallbackQuery):
 
     await call.answer()
 
-@dp.message()
-async def handle_media(msg: types.Message):
-    user_id = msg.from_user.id
-    lang = user_lang.get(user_id, "en")
+# هندلر دستور /compress در گروه (ریپلی به فایل)
+@dp.message(Command("compress"))
+async def compress_command(msg: types.Message):
+    if msg.reply_to_message and (msg.reply_to_message.audio or msg.reply_to_message.video or 
+                                 (msg.reply_to_message.document and msg.reply_to_message.document.mime_type and 
+                                  (msg.reply_to_message.document.mime_type.startswith('audio/') or 
+                                   msg.reply_to_message.document.mime_type.startswith('video/')))):
+        # همان فایل را پردازش کن
+        await handle_media(msg.reply_to_message, is_command=True)
+    else:
+        lang = user_lang.get(msg.from_user.id, "en")
+        await msg.reply(get_text(lang, "help")[:200])  # توضیح کوتاه
 
-    # بررسی محدودیت نرخ درخواست
+@dp.message()
+async def handle_media(msg: types.Message, is_command: bool = False):
+    user_id = msg.from_user.id
+    chat_id = msg.chat.id
+    is_group = chat_id < 0  # چت‌های گروه آیدی منفی دارند
+
+    # تعیین زبان کاربر
+    if user_id in user_lang:
+        lang = user_lang[user_id]
+    else:
+        conn = sqlite3.connect(DB)
+        cur = conn.cursor()
+        cur.execute("SELECT lang FROM users WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        if row:
+            lang = row[0]
+        else:
+            lang = "en"
+        conn.close()
+        user_lang[user_id] = lang
+
+    # بررسی محدودیت نرخ درخواست (برای هر کاربر)
     if not check_rate_limit(user_id):
-        await msg.answer(get_rate_limit_message(lang))
+        await msg.reply(get_rate_limit_message(lang))
         return
 
     # تشخیص نوع رسانه
@@ -456,6 +609,53 @@ async def handle_media(msg: types.Message):
     if not (is_audio or is_video or is_document_audio or is_document_video):
         return
 
+    # اگر در گروه هستیم و دستور مستقیم نیست (یعنی فایل عادی ارسال شده)
+    if is_group and not is_command:
+        # بررسی ادمین بودن ربات
+        if not await is_bot_admin(chat_id):
+            await msg.reply(get_text(lang, "group_not_admin"))
+            return
+        # دریافت تنظیمات کاربر (برای زبان استفاده شده)
+        # ساخت درخواست موقت
+        request_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
+        # تعیین file_id و نوع
+        if is_audio:
+            file_id = msg.audio.file_id
+            is_video_flag = False
+            ext = ".mp3"
+        elif is_document_audio:
+            file_id = msg.document.file_id
+            is_video_flag = False
+            ext = os.path.splitext(msg.document.file_name)[1] or ".mp3"
+        elif is_video:
+            file_id = msg.video.file_id
+            is_video_flag = True
+            ext = ".mp4"
+        else:
+            file_id = msg.document.file_id
+            is_video_flag = True
+            ext = os.path.splitext(msg.document.file_name)[1] or ".mp4"
+
+        # ذخیره در pending
+        group_pending[request_id] = {
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "file_id": file_id,
+            "is_video": is_video_flag,
+            "ext": ext,
+            "message_id": msg.message_id,
+            "timestamp": time.time(),
+            "lang": lang
+        }
+        # ارسال پیام با دکمه‌ها
+        confirm_msg = await msg.reply(
+            get_text(lang, "group_confirm"),
+            reply_markup=group_confirm_kb(request_id, lang)
+        )
+        # ذخیره message_id پیام دکمه‌ها برای حذف بعدی (اختیاری)
+        return
+
+    # حالت خصوصی یا دستور /compress در گروه
     # دریافت تنظیمات کاربر از دیتابیس
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
@@ -476,7 +676,7 @@ async def handle_media(msg: types.Message):
         file_id = msg.video.file_id
         is_video_flag = True
         ext = ".mp4"
-    else:  # is_document_video
+    else:
         file_id = msg.document.file_id
         is_video_flag = True
         ext = os.path.splitext(msg.document.file_name)[1] or ".mp4"
@@ -490,20 +690,18 @@ async def handle_media(msg: types.Message):
         mono_mode=mono_mode,
         is_video=is_video_flag,
         ext=ext,
-        reply_to_message_id=msg.message_id
+        chat_id=chat_id,
+        reply_to_message_id=msg.message_id,
+        requester_name=msg.from_user.full_name if is_group else None
     )
-
-    # اضافه کردن به صف و اعلام به کاربر
     await processing_queue.put(item)
-    await msg.answer(get_text(lang, "queued"))
+    await msg.reply(get_text(lang, "queued"))
 
 # ------------------------- Main -------------------------
 async def main():
-    # راه‌اندازی کارگرهای صف
+    asyncio.create_task(cleanup_pending_requests())
     workers = [asyncio.create_task(queue_worker()) for _ in range(WORKERS_COUNT)]
-    # شروع polling ربات
     await dp.start_polling(bot)
-    # در حالت عادی هیچ‌گاه به اینجا نمی‌رسد، اما برای خوش‌دستی:
     for w in workers:
         w.cancel()
 
