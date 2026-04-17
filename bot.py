@@ -4,11 +4,13 @@ import sqlite3
 import shutil
 import logging
 import subprocess
+import re
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.filters import Command
 from dotenv import load_dotenv
+import yt_dlp
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -65,27 +67,83 @@ QUALITIES = {
 def get_text(lang, key, **kwargs):
     texts = {
         "start": {
-            "fa": "🎵 به ربات فشرده‌ساز موزیک خوش آمدید.\nیک فایل صوتی یا تصویری ارسال کنید تا فشرده شود.\n\nدستورات:\n/quality - تنظیم کیفیت",
-            "en": "🎵 Welcome to Music Compressor.\nSend an audio or video file to compress.\n\nCommands:\n/quality - Set quality"
+            "fa": "🎵 به ربات فشرده‌ساز موزیک خوش آمدید.\n\n"
+                  "📀 **قابلیت‌ها:**\n"
+                  "• ارسال فایل صوتی یا تصویری برای فشرده‌سازی\n"
+                  "• ارسال لینک یوتیوب برای دانلود و فشرده‌سازی خودکار\n\n"
+                  "**دستورات:**\n"
+                  "/quality - تنظیم کیفیت\n"
+                  "/about - درباره ربات\n"
+                  "/help - راهنما",
+            "en": "🎵 Welcome to Music Compressor Bot.\n\n"
+                  "📀 **Features:**\n"
+                  "• Send audio or video file for compression\n"
+                  "• Send YouTube link for automatic download and compression\n\n"
+                  "**Commands:**\n"
+                  "/quality - Set quality\n"
+                  "/about - About bot\n"
+                  "/help - Help"
         },
-        "processing": {
-            "fa": "⏳ در حال پردازش... لطفاً صبر کنید",
-            "en": "⏳ Processing... Please wait"
+        "processing": {"fa": "⏳ در حال پردازش... لطفاً صبر کنید", "en": "⏳ Processing... Please wait"},
+        "done": {"fa": "✅ فشرده‌سازی انجام شد\n📉 کاهش حجم: {percent:.1f}%", "en": "✅ Done\n📉 Reduction: {percent:.1f}%"},
+        "error": {"fa": "❌ خطا در پردازش", "en": "❌ Error"},
+        "quality_set": {"fa": "کیفیت به {name} تغییر کرد", "en": "Quality set to {name}"},
+        "youtube_start": {
+            "fa": "🎬 در حال دریافت اطلاعات ویدیو از یوتیوب...",
+            "en": "🎬 Fetching video info from YouTube..."
         },
-        "done": {
-            "fa": "✅ فشرده‌سازی انجام شد\n📉 کاهش حجم: {percent:.1f}%",
-            "en": "✅ Done\n📉 Reduction: {percent:.1f}%"
+        "youtube_download": {
+            "fa": "📥 در حال دانلود ویدیو از یوتیوب... (این فرآیند ممکن است چند لحظه طول بکشد)",
+            "en": "📥 Downloading video from YouTube... (this may take a few moments)"
         },
-        "error": {
-            "fa": "❌ خطا در پردازش",
-            "en": "❌ Error"
+        "youtube_extract": {
+            "fa": "🎵 در حال استخراج صدا از ویدیو...",
+            "en": "🎵 Extracting audio from video..."
         },
-        "quality_set": {
-            "fa": "کیفیت به {name} تغییر کرد",
-            "en": "Quality set to {name}"
+        "youtube_title": {
+            "fa": "🎬 **{title}**",
+            "en": "🎬 **{title}**"
+        },
+        "about": {
+            "fa": "🤖 ربات فشرده‌ساز موزیک\nنسخه 2.1\n\n"
+                  "قابلیت‌ها:\n"
+                  "• فشرده‌سازی فایل‌های صوتی\n"
+                  "• استخراج صدا از ویدیو\n"
+                  "• دانلود و فشرده‌سازی خودکار از یوتیوب\n\n"
+                  "ساخته شده با aiogram 3 و FFmpeg",
+            "en": "🤖 Music Compressor Bot\nVersion 2.1\n\n"
+                  "Features:\n"
+                  "• Compress audio files\n"
+                  "• Extract audio from video\n"
+                  "• Automatic YouTube download and compression\n\n"
+                  "Built with aiogram 3 and FFmpeg"
+        },
+        "help": {
+            "fa": "📖 **راهنما:**\n\n"
+                  "1️⃣ **فایل صوتی/تصویری:**\n"
+                  "   یک فایل صوتی یا تصویری ارسال کنید، ربات آن را فشرده می‌کند.\n\n"
+                  "2️⃣ **لینک یوتیوب:**\n"
+                  "   یک لینک یوتیوب ارسال کنید، ربات:\n"
+                  "   • ویدیو را دانلود می‌کند\n"
+                  "   • صدای آن را استخراج می‌کند\n"
+                  "   • فشرده می‌کند و برای شما ارسال می‌کند\n\n"
+                  "3️⃣ **تنظیم کیفیت:**\n"
+                  "   از دستور /quality برای تنظیم کیفیت فشرده‌سازی استفاده کنید.\n\n"
+                  "⏱️ فایل‌ها به مدت ۲۴ ساعت در سرور نگهداری می‌شوند.",
+            "en": "📖 **Help:**\n\n"
+                  "1️⃣ **Audio/Video File:**\n"
+                  "   Send an audio or video file, the bot will compress it.\n\n"
+                  "2️⃣ **YouTube Link:**\n"
+                  "   Send a YouTube link, the bot will:\n"
+                  "   • Download the video\n"
+                  "   • Extract the audio\n"
+                  "   • Compress and send it to you\n\n"
+                  "3️⃣ **Quality Settings:**\n"
+                  "   Use /quality command to set compression quality.\n\n"
+                  "⏱️ Files are kept on server for 24 hours."
         }
     }
-    txt = texts[key][lang]
+    txt = texts.get(key, {}).get(lang, texts.get(key, {}).get("en", "Processing error"))
     return txt.format(**kwargs) if kwargs else txt
 
 def main_kb(lang):
@@ -104,6 +162,56 @@ def quality_kb(lang, current):
         buttons.append([InlineKeyboardButton(text=text, callback_data=f"quality_{qid}")])
     buttons.append([InlineKeyboardButton(text="🔙 بازگشت" if lang == "fa" else "🔙 Back", callback_data="back")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def is_youtube_url(url: str) -> bool:
+    """بررسی لینک یوتیوب"""
+    youtube_patterns = [
+        r'(https?://)?(www\.)?(youtube\.com|youtu\.be)/',
+        r'(https?://)?(www\.)?(m\.youtube\.com)/',
+        r'(https?://)?(www\.)?(music\.youtube\.com)/'
+    ]
+    for pattern in youtube_patterns:
+        if re.match(pattern, url):
+            return True
+    return False
+
+async def download_youtube_audio(url: str, output_path: str, progress_msg: types.Message = None) -> tuple:
+    """دانلود صدا از یوتیوب و برگرداندن مسیر فایل و عنوان ویدیو"""
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }],
+        'outtmpl': output_path.replace('.mp3', ''),
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': False,
+    }
+    
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
+            # دریافت اطلاعات ویدیو
+            info = ydl.extract_info(url, download=False)
+            title = info.get('title', 'Unknown Title')
+            
+            # دانلود و تبدیل
+            ydl.download([url])
+            
+            # فایل نهایی با پسوند mp3
+            final_path = output_path.replace('.mp3', '.mp3')
+            if not os.path.exists(final_path):
+                # اگر فایل با نام متفاوت ذخیره شده، آن را پیدا کن
+                for f in os.listdir(os.path.dirname(final_path)):
+                    if f.endswith('.mp3') and str(info.get('id', '')) in f:
+                        final_path = os.path.join(os.path.dirname(final_path), f)
+                        break
+            
+            return final_path, title
+        except Exception as e:
+            logger.error(f"yt-dlp error: {e}")
+            raise
 
 async def run_ffmpeg(cmd, step_name=""):
     """اجرای دستور ffmpeg و برگرداندن نتیجه موفقیت/شکست"""
@@ -139,7 +247,7 @@ async def start(msg: types.Message):
     lang = cur.fetchone()[0]
     conn.close()
     user_lang[user_id] = lang
-    await msg.answer(get_text(lang, "start"), reply_markup=main_kb(lang))
+    await msg.answer(get_text(lang, "start"), reply_markup=main_kb(lang), parse_mode="Markdown")
 
 @dp.message(Command("quality"))
 async def quality_cmd(msg: types.Message):
@@ -152,6 +260,18 @@ async def quality_cmd(msg: types.Message):
     conn.close()
     await msg.answer("Select quality:" if lang == "en" else "کیفیت مورد نظر را انتخاب کنید:", 
                      reply_markup=quality_kb(lang, current))
+
+@dp.message(Command("about"))
+async def about_cmd(msg: types.Message):
+    user_id = msg.from_user.id
+    lang = user_lang.get(user_id, "en")
+    await msg.answer(get_text(lang, "about"), reply_markup=main_kb(lang), parse_mode="Markdown")
+
+@dp.message(Command("help"))
+async def help_cmd(msg: types.Message):
+    user_id = msg.from_user.id
+    lang = user_lang.get(user_id, "en")
+    await msg.answer(get_text(lang, "help"), reply_markup=main_kb(lang), parse_mode="Markdown")
 
 @dp.callback_query()
 async def callback(call: types.CallbackQuery):
@@ -171,7 +291,7 @@ async def callback(call: types.CallbackQuery):
         conn.commit()
         conn.close()
         user_lang[user_id] = data
-        await call.message.edit_text(get_text(data, "start"), reply_markup=main_kb(data))
+        await call.message.edit_text(get_text(data, "start"), reply_markup=main_kb(data), parse_mode="Markdown")
 
     elif data == "quality_menu":
         await call.message.edit_text("Select quality:" if lang == "en" else "کیفیت مورد نظر را انتخاب کنید:", 
@@ -189,7 +309,7 @@ async def callback(call: types.CallbackQuery):
             await call.message.edit_text(get_text(lang, "quality_set", name=name), reply_markup=main_kb(lang))
 
     elif data == "back":
-        await call.message.edit_text(get_text(lang, "start"), reply_markup=main_kb(lang))
+        await call.message.edit_text(get_text(lang, "start"), reply_markup=main_kb(lang), parse_mode="Markdown")
 
     elif data == "donate":
         if lang == "fa":
@@ -217,7 +337,16 @@ async def callback(call: types.CallbackQuery):
 
 @dp.message()
 async def handle_media(msg: types.Message):
-    """پردازش فایل صوتی یا ویدیویی"""
+    """پردازش فایل صوتی، ویدیویی یا لینک یوتیوب"""
+    user_id = msg.from_user.id
+    lang = user_lang.get(user_id, "en")
+    text = msg.text or msg.caption or ""
+    
+    # تشخیص لینک یوتیوب
+    if text and is_youtube_url(text):
+        await handle_youtube(msg, text, lang)
+        return
+    
     # تشخیص نوع رسانه
     is_audio = msg.audio is not None
     is_video = msg.video is not None
@@ -227,8 +356,6 @@ async def handle_media(msg: types.Message):
     if not (is_audio or is_video or is_document_audio or is_document_video):
         return
 
-    user_id = msg.from_user.id
-    lang = user_lang.get(user_id, "en")
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
     cur.execute("SELECT quality FROM users WHERE user_id = ?", (user_id,))
@@ -236,15 +363,13 @@ async def handle_media(msg: types.Message):
     conn.close()
     bitrate = QUALITIES[quality]["bitrate"]
 
-    # پیام پیشرفت (نوار پیشرفت تقریبی)
-    progress_msg = await msg.answer("⏳ [⬜⬜⬜⬜⬜] 0% - " + ("در حال دانلود..." if lang == "fa" else "Downloading..."))
+    progress_msg = await msg.answer(get_text(lang, "processing"))
 
     input_path = None
     output_path = None
-    temp_audio_path = None  # برای فایل ویدیویی: صدا استخراج شده موقت
+    temp_audio_path = None
 
     try:
-        # تعیین فایل ورودی
         if is_audio:
             file_id = msg.audio.file_id
             ext = ".mp3"
@@ -254,33 +379,28 @@ async def handle_media(msg: types.Message):
         elif is_video:
             file_id = msg.video.file_id
             ext = ".mp4"
-        else:  # is_document_video
+        else:
             file_id = msg.document.file_id
             ext = os.path.splitext(msg.document.file_name)[1] or ".mp4"
 
-        # دانلود فایل
         file = await bot.get_file(file_id)
         input_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_in{ext}")
         await bot.download_file(file.file_path, input_path)
 
-        # مرحله 1: دانلود کامل شد
         await progress_msg.edit_text("⏳ [🟩⬜⬜⬜⬜] 20% - " + ("دانلود شد، در حال آماده‌سازی..." if lang == "fa" else "Downloaded, preparing..."))
 
-        # اگر ویدیو بود، صدا را استخراج کن
         if is_video or is_document_video:
             temp_audio_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_temp_audio.mp3")
             await progress_msg.edit_text("⏳ [🟩🟩⬜⬜⬜] 40% - " + ("در حال استخراج صدا از ویدیو..." if lang == "fa" else "Extracting audio from video..."))
             success = await extract_audio_from_video(input_path, temp_audio_path)
             if not success:
                 raise Exception("Audio extraction failed")
-            # فایل ورودی برای فشرده‌سازی، فایل صوتی استخراج شده است
             audio_for_compress = temp_audio_path
-            await progress_msg.edit_text("⏳ [🟩🟩🟩⬜⬜] 60% - " + ("صداستخراج شد، در حال فشرده‌سازی..." if lang == "fa" else "Audio extracted, compressing..."))
+            await progress_msg.edit_text("⏳ [🟩🟩🟩⬜⬜] 60% - " + ("صدا استخراج شد، در حال فشرده‌سازی..." if lang == "fa" else "Audio extracted, compressing..."))
         else:
             audio_for_compress = input_path
             await progress_msg.edit_text("⏳ [🟩🟩🟩⬜⬜] 60% - " + ("در حال فشرده‌سازی..." if lang == "fa" else "Compressing..."))
 
-        # فشرده‌سازی
         output_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_out.mp3")
         success = await compress_audio_async(audio_for_compress, output_path, bitrate)
         if not success:
@@ -288,12 +408,10 @@ async def handle_media(msg: types.Message):
 
         await progress_msg.edit_text("⏳ [🟩🟩🟩🟩🟩] 100% - " + ("آماده ارسال..." if lang == "fa" else "Ready to send..."))
 
-        # محاسبه حجم و درصد کاهش
         orig_size = os.path.getsize(audio_for_compress) / (1024*1024)
         new_size = os.path.getsize(output_path) / (1024*1024)
         percent = (1 - new_size/orig_size) * 100
 
-        # ذخیره در دیتابیس برای پاکسازی بعدی
         expire = datetime.now() + timedelta(days=1)
         conn = sqlite3.connect(DB)
         cur = conn.cursor()
@@ -301,10 +419,7 @@ async def handle_media(msg: types.Message):
         conn.commit()
         conn.close()
 
-        # حذف پیام پیشرفت
         await progress_msg.delete()
-
-        # ارسال نتیجه و فایل
         await msg.answer(get_text(lang, "done", percent=percent))
         await msg.answer_audio(FSInputFile(output_path))
 
@@ -313,8 +428,72 @@ async def handle_media(msg: types.Message):
         await progress_msg.delete()
         await msg.answer(get_text(lang, "error"))
     finally:
-        # پاکسازی فایل‌های موقت
         for f in [input_path, temp_audio_path, output_path]:
+            if f and os.path.exists(f):
+                try:
+                    os.remove(f)
+                except:
+                    pass
+
+async def handle_youtube(msg: types.Message, url: str, lang: str):
+    """پردازش لینک یوتیوب"""
+    user_id = msg.from_user.id
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+    cur.execute("SELECT quality FROM users WHERE user_id = ?", (user_id,))
+    quality = cur.fetchone()[0]
+    conn.close()
+    bitrate = QUALITIES[quality]["bitrate"]
+    
+    # پیام پیشرفت
+    progress_msg = await msg.answer(get_text(lang, "youtube_start"))
+    
+    output_file = None
+    downloaded_audio = None
+    
+    try:
+        # مرحله 1: دریافت اطلاعات و دانلود
+        await progress_msg.edit_text(get_text(lang, "youtube_download"))
+        temp_audio_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_youtube")
+        downloaded_audio, title = await download_youtube_audio(url, temp_audio_path, progress_msg)
+        
+        # نمایش عنوان ویدیو
+        await msg.answer(get_text(lang, "youtube_title", title=title), parse_mode="Markdown")
+        
+        # مرحله 2: فشرده‌سازی
+        await progress_msg.edit_text(get_text(lang, "youtube_extract"))
+        output_file = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_compressed.mp3")
+        
+        # فشرده‌سازی با کیفیت انتخابی کاربر
+        success = await compress_audio_async(downloaded_audio, output_file, bitrate)
+        if not success:
+            raise Exception("Compression failed")
+        
+        # محاسبه حجم و درصد کاهش
+        orig_size = os.path.getsize(downloaded_audio) / (1024*1024)
+        new_size = os.path.getsize(output_file) / (1024*1024)
+        percent = (1 - new_size/orig_size) * 100
+        
+        # ذخیره در دیتابیس
+        expire = datetime.now() + timedelta(days=1)
+        conn = sqlite3.connect(DB)
+        cur = conn.cursor()
+        cur.execute("INSERT INTO files (user_id, file_path, expire_at) VALUES (?, ?, ?)", (user_id, output_file, expire.isoformat()))
+        conn.commit()
+        conn.close()
+        
+        # ارسال فایل فشرده شده
+        await progress_msg.delete()
+        await msg.answer(get_text(lang, "done", percent=percent))
+        await msg.answer_audio(FSInputFile(output_file))
+        
+    except Exception as e:
+        logger.exception("Error in handle_youtube")
+        await progress_msg.delete()
+        await msg.answer(get_text(lang, "error"))
+    finally:
+        # پاکسازی فایل‌های موقت
+        for f in [downloaded_audio, output_file]:
             if f and os.path.exists(f):
                 try:
                     os.remove(f)
