@@ -164,7 +164,6 @@ def quality_kb(lang, current):
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def is_youtube_url(url: str) -> bool:
-    """بررسی لینک یوتیوب"""
     youtube_patterns = [
         r'(https?://)?(www\.)?(youtube\.com|youtu\.be)/',
         r'(https?://)?(www\.)?(m\.youtube\.com)/',
@@ -176,7 +175,8 @@ def is_youtube_url(url: str) -> bool:
     return False
 
 async def download_youtube_audio(url: str, output_path: str, progress_msg: types.Message = None) -> tuple:
-    """دانلود صدا از یوتیوب و برگرداندن مسیر فایل و عنوان ویدیو"""
+    """دانلود صدا از یوتیوب با استفاده از کوکی و تنظیمات ضد محدودیت"""
+    # تنظیمات پیشرفته برای دور زدن محدودیت یوتیوب
     ydl_opts = {
         'format': 'bestaudio/best',
         'postprocessors': [{
@@ -188,33 +188,39 @@ async def download_youtube_audio(url: str, output_path: str, progress_msg: types
         'quiet': True,
         'no_warnings': True,
         'extract_flat': False,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android'],  # شبیه‌سازی کلاینت اندروید
+                'skip': ['hls', 'dash']       # رد کردن فرمت‌های مشکل‌دار
+            }
+        },
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
+    
+    # اگر فایل cookies.txt وجود داشت، از آن استفاده کن
+    if os.path.exists('cookies.txt'):
+        ydl_opts['cookiefile'] = 'cookies.txt'
+        logger.info("Using cookies.txt for YouTube")
+    else:
+        logger.warning("cookies.txt not found, trying without cookies (may fail)")
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
-            # دریافت اطلاعات ویدیو
             info = ydl.extract_info(url, download=False)
             title = info.get('title', 'Unknown Title')
-            
-            # دانلود و تبدیل
             ydl.download([url])
-            
-            # فایل نهایی با پسوند mp3
             final_path = output_path.replace('.mp3', '.mp3')
             if not os.path.exists(final_path):
-                # اگر فایل با نام متفاوت ذخیره شده، آن را پیدا کن
                 for f in os.listdir(os.path.dirname(final_path)):
                     if f.endswith('.mp3') and str(info.get('id', '')) in f:
                         final_path = os.path.join(os.path.dirname(final_path), f)
                         break
-            
             return final_path, title
         except Exception as e:
             logger.error(f"yt-dlp error: {e}")
             raise
 
 async def run_ffmpeg(cmd, step_name=""):
-    """اجرای دستور ffmpeg و برگرداندن نتیجه موفقیت/شکست"""
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=subprocess.PIPE,
@@ -227,12 +233,10 @@ async def run_ffmpeg(cmd, step_name=""):
     return True
 
 async def extract_audio_from_video(video_path, audio_path):
-    """استخراج صدا از ویدیو (تبدیل به mp3 با کیفیت اصلی)"""
     cmd = [FFMPEG_PATH, "-i", video_path, "-q:a", "0", "-map", "a", audio_path, "-y"]
     return await run_ffmpeg(cmd, "extract_audio")
 
 async def compress_audio_async(input_path, output_path, bitrate):
-    """فشرده‌سازی فایل صوتی با نرخ بیت مشخص"""
     cmd = [FFMPEG_PATH, "-i", input_path, "-b:a", bitrate, "-y", output_path]
     return await run_ffmpeg(cmd, "compress_audio")
 
@@ -337,17 +341,14 @@ async def callback(call: types.CallbackQuery):
 
 @dp.message()
 async def handle_media(msg: types.Message):
-    """پردازش فایل صوتی، ویدیویی یا لینک یوتیوب"""
     user_id = msg.from_user.id
     lang = user_lang.get(user_id, "en")
     text = msg.text or msg.caption or ""
     
-    # تشخیص لینک یوتیوب
     if text and is_youtube_url(text):
         await handle_youtube(msg, text, lang)
         return
     
-    # تشخیص نوع رسانه
     is_audio = msg.audio is not None
     is_video = msg.video is not None
     is_document_audio = (msg.document and msg.document.mime_type and msg.document.mime_type.startswith('audio/'))
@@ -436,7 +437,6 @@ async def handle_media(msg: types.Message):
                     pass
 
 async def handle_youtube(msg: types.Message, url: str, lang: str):
-    """پردازش لینک یوتیوب"""
     user_id = msg.from_user.id
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
@@ -445,36 +445,29 @@ async def handle_youtube(msg: types.Message, url: str, lang: str):
     conn.close()
     bitrate = QUALITIES[quality]["bitrate"]
     
-    # پیام پیشرفت
     progress_msg = await msg.answer(get_text(lang, "youtube_start"))
     
     output_file = None
     downloaded_audio = None
     
     try:
-        # مرحله 1: دریافت اطلاعات و دانلود
         await progress_msg.edit_text(get_text(lang, "youtube_download"))
         temp_audio_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_youtube")
         downloaded_audio, title = await download_youtube_audio(url, temp_audio_path, progress_msg)
         
-        # نمایش عنوان ویدیو
         await msg.answer(get_text(lang, "youtube_title", title=title), parse_mode="Markdown")
         
-        # مرحله 2: فشرده‌سازی
         await progress_msg.edit_text(get_text(lang, "youtube_extract"))
         output_file = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_compressed.mp3")
         
-        # فشرده‌سازی با کیفیت انتخابی کاربر
         success = await compress_audio_async(downloaded_audio, output_file, bitrate)
         if not success:
             raise Exception("Compression failed")
         
-        # محاسبه حجم و درصد کاهش
         orig_size = os.path.getsize(downloaded_audio) / (1024*1024)
         new_size = os.path.getsize(output_file) / (1024*1024)
         percent = (1 - new_size/orig_size) * 100
         
-        # ذخیره در دیتابیس
         expire = datetime.now() + timedelta(days=1)
         conn = sqlite3.connect(DB)
         cur = conn.cursor()
@@ -482,7 +475,6 @@ async def handle_youtube(msg: types.Message, url: str, lang: str):
         conn.commit()
         conn.close()
         
-        # ارسال فایل فشرده شده
         await progress_msg.delete()
         await msg.answer(get_text(lang, "done", percent=percent))
         await msg.answer_audio(FSInputFile(output_file))
@@ -492,7 +484,6 @@ async def handle_youtube(msg: types.Message, url: str, lang: str):
         await progress_msg.delete()
         await msg.answer(get_text(lang, "error"))
     finally:
-        # پاکسازی فایل‌های موقت
         for f in [downloaded_audio, output_file]:
             if f and os.path.exists(f):
                 try:
