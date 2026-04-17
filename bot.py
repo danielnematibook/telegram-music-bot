@@ -3,6 +3,7 @@ import asyncio
 import sqlite3
 import shutil
 import logging
+import subprocess  # اضافه شد برای استفاده از subprocess.PIPE
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -51,24 +52,45 @@ user_lang = {}
 
 def get_text(lang, key):
     texts = {
-        "start": {"fa": "🎵 موزیک ارسال کنید تا فشرده شود", "en": "🎵 Send music to compress"},
-        "done": {"fa": "✅ آماده شد", "en": "✅ Done"},
-        "donate": {"fa": "💖 این بات رایگان است\nسازنده: Daniel Nemati", "en": "💖 Free bot\nCreator: Daniel Nemati"},
-        "error": {"fa": "❌ خطا در پردازش", "en": "❌ Error"}
+        "start": {
+            "fa": "🎵 موزیک ارسال کنید تا فشرده شود",
+            "en": "🎵 Send music to compress"
+        },
+        "done": {
+            "fa": "✅ آماده شد",
+            "en": "✅ Done"
+        },
+        "donate": {
+            "fa": "💖 این بات رایگان است\nسازنده: Daniel Nemati",
+            "en": "💖 Free bot\nCreator: Daniel Nemati"
+        },
+        "error": {
+            "fa": "❌ خطا در پردازش",
+            "en": "❌ Error"
+        }
     }
     return texts[key][lang]
 
 def main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🇮🇷 فارسی", callback_data="fa"),
-         InlineKeyboardButton(text="🇬🇧 English", callback_data="en")],
-        [InlineKeyboardButton(text="💖 Donate", callback_data="donate")]
+        [
+            InlineKeyboardButton(text="🇮🇷 فارسی", callback_data="fa"),
+            InlineKeyboardButton(text="🇬🇧 English", callback_data="en")
+        ],
+        [
+            InlineKeyboardButton(text="💖 Donate", callback_data="donate")
+        ]
     ])
 
 async def compress_audio_async(input_path, output_path):
+    # اصلاح: استفاده از subprocess.PIPE به جای asyncio.PIPE
     cmd = [FFMPEG_PATH, "-i", input_path, "-b:a", "64k", output_path]
-    process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.PIPE, stderr=asyncio.PIPE)
-    _, stderr = await process.communicate()
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+    stdout, stderr = await process.communicate()
     if process.returncode != 0:
         logger.error(f"FFmpeg error: {stderr.decode()}")
         raise RuntimeError("FFmpeg failed")
@@ -94,13 +116,27 @@ async def handle_audio(msg: types.Message):
         return
     lang = user_lang.get(msg.from_user.id, "en")
     user_id = msg.from_user.id
+    input_file = None
+    output_file = None
     try:
-        file_id = msg.audio.file_id if msg.audio else msg.document.file_id
+        # تعیین فایل
+        if msg.audio:
+            file_id = msg.audio.file_id
+        else:
+            # اگر سند است و فرمت صوتی ندارد، رد کن
+            if msg.document.mime_type and not msg.document.mime_type.startswith('audio/'):
+                await msg.answer("❌ لطفاً فایل صوتی ارسال کنید / Please send an audio file")
+                return
+            file_id = msg.document.file_id
+
         file = await bot.get_file(file_id)
+
         input_file = f"{DOWNLOAD_DIR}/{user_id}_in.mp3"
         output_file = f"{DOWNLOAD_DIR}/{user_id}_out.mp3"
+
         await bot.download_file(file.file_path, input_file)
         await compress_audio_async(input_file, output_file)
+
         expire = datetime.now() + timedelta(days=1)
         conn = sqlite3.connect(DB)
         cur = conn.cursor()
@@ -108,16 +144,21 @@ async def handle_audio(msg: types.Message):
                     (user_id, output_file, expire.isoformat()))
         conn.commit()
         conn.close()
+
         await msg.answer(get_text(lang, "done"))
         await msg.answer_audio(types.FSInputFile(output_file))
-        if os.path.exists(input_file):
-            os.remove(input_file)
+
     except Exception as e:
-        logger.exception("Error")
+        logger.exception("Error in handle_audio")
         await msg.answer(get_text(lang, "error"))
+    finally:
+        # پاکسازی فایل‌های موقت
         for f in [input_file, output_file]:
-            if 'f' in locals() and os.path.exists(f):
-                os.remove(f)
+            if f and os.path.exists(f):
+                try:
+                    os.remove(f)
+                except:
+                    pass
 
 async def cleanup():
     while True:
