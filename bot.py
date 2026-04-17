@@ -80,8 +80,7 @@ def main_kb(lang):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🇮🇷 فارسی", callback_data="fa"),
          InlineKeyboardButton(text="🇬🇧 English", callback_data="en")],
-        [InlineKeyboardButton(text="⚙️ کیفیت", callback_data="quality_menu")],
-        # دکمه دونیت با رنگ آبی (primary)
+        [InlineKeyboardButton(text="⚙️ کیفیت" if lang == "fa" else "⚙️ Quality", callback_data="quality_menu")],
         [InlineKeyboardButton(text="💖 Donate", callback_data="donate", style="primary")]
     ])
 
@@ -91,7 +90,7 @@ def quality_kb(lang, current):
         name = q["name_fa"] if lang == "fa" else q["name_en"]
         text = f"{'✅ ' if qid == current else ''}{name}"
         buttons.append([InlineKeyboardButton(text=text, callback_data=f"quality_{qid}")])
-    buttons.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="back")])
+    buttons.append([InlineKeyboardButton(text="🔙 بازگشت" if lang == "fa" else "🔙 Back", callback_data="back")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 async def compress_audio_async(input_path, output_path, bitrate):
@@ -129,7 +128,8 @@ async def quality_cmd(msg: types.Message):
     cur.execute("SELECT quality FROM users WHERE user_id = ?", (user_id,))
     current = cur.fetchone()[0]
     conn.close()
-    await msg.answer("Select quality:", reply_markup=quality_kb(lang, current))
+    await msg.answer("Select quality:" if lang == "en" else "کیفیت مورد نظر را انتخاب کنید:", 
+                     reply_markup=quality_kb(lang, current))
 
 @dp.callback_query()
 async def callback(call: types.CallbackQuery):
@@ -152,7 +152,8 @@ async def callback(call: types.CallbackQuery):
         await call.message.edit_text(get_text(data, "start"), reply_markup=main_kb(data))
 
     elif data == "quality_menu":
-        await call.message.edit_text("Select quality:", reply_markup=quality_kb(lang, quality))
+        await call.message.edit_text("Select quality:" if lang == "en" else "کیفیت مورد نظر را انتخاب کنید:", 
+                                     reply_markup=quality_kb(lang, quality))
 
     elif data.startswith("quality_"):
         qid = data.split("_")[1]
@@ -169,15 +170,25 @@ async def callback(call: types.CallbackQuery):
         await call.message.edit_text(get_text(lang, "start"), reply_markup=main_kb(lang))
 
     elif data == "donate":
-        # ارسال پیام جدید با اطلاعات حمایت مالی
-        donate_text = (
-            "💖 این ربات به رایگان در اختیار شما قرار گرفته است اما برای بقای این پروژه می‌توانید از ما حمایت مالی کنید:\n\n"
-            "**Ton network:**\n"
-            "`UQCv_m88yafoOWMD9h9MMglPP3DSiBL5xbLiU7akxWs5Q0pk`\n\n"
-            "**USDT TRC20**\n"
-            "`THXUWRaBgEyC27e8xC9JWG7unvygkFGNov`\n\n"
-            "سازنده: Daniel Nemati"
-        )
+        # متن دونیت بر اساس زبان کاربر
+        if lang == "fa":
+            donate_text = (
+                "💖 این ربات به رایگان در اختیار شما قرار گرفته است اما برای بقای این پروژه می‌توانید از ما حمایت مالی کنید:\n\n"
+                "**شبکه Ton:**\n"
+                "`UQCv_m88yafoOWMD9h9MMglPP3DSiBL5xbLiU7akxWs5Q0pk`\n\n"
+                "**شبکه TRC20 (USDT)**\n"
+                "`THXUWRaBgEyC27e8xC9JWG7unvygkFGNov`\n\n"
+                "سازنده: Daniel Nemati"
+            )
+        else:
+            donate_text = (
+                "💖 This bot is provided to you for free, but to support the continuation of this project, you can donate:\n\n"
+                "**Ton Network:**\n"
+                "`UQCv_m88yafoOWMD9h9MMglPP3DSiBL5xbLiU7akxWs5Q0pk`\n\n"
+                "**USDT TRC20**\n"
+                "`THXUWRaBgEyC27e8xC9JWG7unvygkFGNov`\n\n"
+                "Creator: Daniel Nemati"
+            )
         await call.message.answer(donate_text, parse_mode="MarkdownV2")
         await call.answer()
 
