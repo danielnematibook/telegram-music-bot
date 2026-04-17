@@ -19,7 +19,7 @@ if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN not found")
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()   # <--- این خط حتماً باید قبل از دکوراتورها باشد
+dp = Dispatcher()
 
 DB = "database.db"
 DOWNLOAD_DIR = "downloads"
@@ -81,7 +81,8 @@ def main_kb(lang):
         [InlineKeyboardButton(text="🇮🇷 فارسی", callback_data="fa"),
          InlineKeyboardButton(text="🇬🇧 English", callback_data="en")],
         [InlineKeyboardButton(text="⚙️ کیفیت", callback_data="quality_menu")],
-        [InlineKeyboardButton(text="💖 Donate", callback_data="donate")]
+        # دکمه دونیت با رنگ آبی (primary)
+        [InlineKeyboardButton(text="💖 Donate", callback_data="donate", style="primary")]
     ])
 
 def quality_kb(lang, current):
@@ -149,8 +150,10 @@ async def callback(call: types.CallbackQuery):
         conn.close()
         user_lang[user_id] = data
         await call.message.edit_text(get_text(data, "start"), reply_markup=main_kb(data))
+
     elif data == "quality_menu":
         await call.message.edit_text("Select quality:", reply_markup=quality_kb(lang, quality))
+
     elif data.startswith("quality_"):
         qid = data.split("_")[1]
         if qid in QUALITIES:
@@ -161,10 +164,23 @@ async def callback(call: types.CallbackQuery):
             conn.close()
             name = QUALITIES[qid]["name_fa"] if lang == "fa" else QUALITIES[qid]["name_en"]
             await call.message.edit_text(get_text(lang, "quality_set", name=name), reply_markup=main_kb(lang))
+
     elif data == "back":
         await call.message.edit_text(get_text(lang, "start"), reply_markup=main_kb(lang))
+
     elif data == "donate":
-        await call.answer("BTC: 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", show_alert=True)
+        # ارسال پیام جدید با اطلاعات حمایت مالی
+        donate_text = (
+            "💖 این ربات به رایگان در اختیار شما قرار گرفته است اما برای بقای این پروژه می‌توانید از ما حمایت مالی کنید:\n\n"
+            "**Ton network:**\n"
+            "`UQCv_m88yafoOWMD9h9MMglPP3DSiBL5xbLiU7akxWs5Q0pk`\n\n"
+            "**USDT TRC20**\n"
+            "`THXUWRaBgEyC27e8xC9JWG7unvygkFGNov`\n\n"
+            "سازنده: Daniel Nemati"
+        )
+        await call.message.answer(donate_text, parse_mode="MarkdownV2")
+        await call.answer()
+
     await call.answer()
 
 @dp.message()
