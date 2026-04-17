@@ -4,6 +4,8 @@ import sqlite3
 import shutil
 import logging
 import subprocess
+import time
+from collections import defaultdict
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
@@ -31,6 +33,29 @@ if FFMPEG_PATH is None:
     raise RuntimeError("FFmpeg missing")
 logger.info(f"FFmpeg at {FFMPEG_PATH}")
 
+# ------------------------- Rate Limiting -------------------------
+# ساختار ذخیره درخواست‌ها: {user_id: [timestamp1, timestamp2, ...]}
+request_history = defaultdict(list)
+RATE_LIMIT = 5  # تعداد مجاز در دقیقه
+RATE_WINDOW = 60  # ثانیه
+
+def check_rate_limit(user_id: int) -> bool:
+    """بررسی محدودیت نرخ درخواست. برگرداندن True اگر مجاز باشد."""
+    now = time.time()
+    # پاک کردن درخواست‌های قدیمی‌تر از یک دقیقه
+    request_history[user_id] = [t for t in request_history[user_id] if now - t < RATE_WINDOW]
+    if len(request_history[user_id]) >= RATE_LIMIT:
+        return False
+    request_history[user_id].append(now)
+    return True
+
+def get_rate_limit_message(lang: str) -> str:
+    if lang == "fa":
+        return f"⏳ شما بیش از حد مجاز ({RATE_LIMIT} فایل در دقیقه) درخواست ارسال کردید. لطفاً کمی صبر کنید."
+    else:
+        return f"⏳ You have exceeded the rate limit ({RATE_LIMIT} files per minute). Please wait a moment."
+
+# ------------------------- Database -------------------------
 def init_db():
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
@@ -38,7 +63,8 @@ def init_db():
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
         lang TEXT DEFAULT 'en',
-        quality TEXT DEFAULT 'medium'
+        quality TEXT DEFAULT 'medium',
+        mono_mode INTEGER DEFAULT 0   -- 0: stereo, 1: mono
     )
     """)
     cur.execute("""
@@ -71,6 +97,7 @@ def get_text(lang, key, **kwargs):
                   "• ارسال فایل ویدیویی برای استخراج صدا و فشرده‌سازی\n\n"
                   "**دستورات:**\n"
                   "/quality - تنظیم کیفیت\n"
+                  "/mono - تنظیم مونو/استریو\n"
                   "/about - درباره ربات\n"
                   "/help - راهنما",
             "en": "🎵 Welcome to Music Compressor Bot.\n\n"
@@ -79,6 +106,7 @@ def get_text(lang, key, **kwargs):
                   "• Send video file to extract audio and compress\n\n"
                   "**Commands:**\n"
                   "/quality - Set quality\n"
+                  "/mono - Set mono/stereo\n"
                   "/about - About bot\n"
                   "/help - Help"
         },
@@ -86,16 +114,28 @@ def get_text(lang, key, **kwargs):
         "done": {"fa": "✅ فشرده‌سازی انجام شد\n📉 کاهش حجم: {percent:.1f}%", "en": "✅ Done\n📉 Reduction: {percent:.1f}%"},
         "error": {"fa": "❌ خطا در پردازش", "en": "❌ Error"},
         "quality_set": {"fa": "کیفیت به {name} تغییر کرد", "en": "Quality set to {name}"},
+        "mono_set": {
+            "fa": "حالت پخش به **{mode}** تغییر کرد.\n(حالت مونو حجم فایل را تا ۴۰٪ کاهش می‌دهد)",
+            "en": "Audio mode changed to **{mode}**.\n(Mono mode reduces file size up to 40%)"
+        },
+        "mono_current": {
+            "fa": "حالت فعلی: {mode}",
+            "en": "Current mode: {mode}"
+        },
         "about": {
-            "fa": "🤖 ربات فشرده‌ساز موزیک\nنسخه 2.0\n\n"
+            "fa": "🤖 ربات فشرده‌ساز موزیک\nنسخه 2.1\n\n"
                   "قابلیت‌ها:\n"
                   "• فشرده‌سازی فایل‌های صوتی\n"
-                  "• استخراج صدا از ویدیو و فشرده‌سازی\n\n"
+                  "• استخراج صدا از ویدیو و فشرده‌سازی\n"
+                  "• تبدیل استریو به مونو\n"
+                  "• محدودیت نرخ درخواست\n\n"
                   "ساخته شده با aiogram 3 و FFmpeg",
-            "en": "🤖 Music Compressor Bot\nVersion 2.0\n\n"
+            "en": "🤖 Music Compressor Bot\nVersion 2.1\n\n"
                   "Features:\n"
                   "• Compress audio files\n"
-                  "• Extract audio from video and compress\n\n"
+                  "• Extract audio from video and compress\n"
+                  "• Stereo to mono conversion\n"
+                  "• Rate limiting\n\n"
                   "Built with aiogram 3 and FFmpeg"
         },
         "help": {
@@ -106,7 +146,10 @@ def get_text(lang, key, **kwargs):
                   "   یک فایل ویدیویی (mp4, mkv, avi, mov) ارسال کنید، ربات صدای آن را استخراج کرده، فشرده می‌کند و برای شما ارسال می‌کند.\n\n"
                   "3️⃣ **تنظیم کیفیت:**\n"
                   "   از دستور /quality برای تنظیم کیفیت فشرده‌سازی استفاده کنید.\n\n"
-                  "⏱️ فایل‌ها به مدت ۲۴ ساعت در سرور نگهداری می‌شوند.",
+                  "4️⃣ **تبدیل به مونو:**\n"
+                  "   از دستور /mono برای کاهش حجم بیشتر (مناسب پادکست و کتاب صوتی) استفاده کنید.\n\n"
+                  "⏱️ فایل‌ها به مدت ۲۴ ساعت در سرور نگهداری می‌شوند.\n"
+                  f"⏳ محدودیت: {RATE_LIMIT} فایل در دقیقه",
             "en": "📖 **Help:**\n\n"
                   "1️⃣ **Audio File:**\n"
                   "   Send an audio file (mp3, m4a, ogg, wav), the bot will compress it.\n\n"
@@ -114,7 +157,10 @@ def get_text(lang, key, **kwargs):
                   "   Send a video file (mp4, mkv, avi, mov), the bot will extract its audio, compress it and send back.\n\n"
                   "3️⃣ **Quality Settings:**\n"
                   "   Use /quality command to set compression quality.\n\n"
-                  "⏱️ Files are kept on server for 24 hours."
+                  "4️⃣ **Mono Mode:**\n"
+                  "   Use /mono command to reduce file size further (ideal for podcasts and audiobooks).\n\n"
+                  "⏱️ Files are kept on server for 24 hours.\n"
+                  f"⏳ Rate limit: {RATE_LIMIT} files per minute"
         }
     }
     txt = texts.get(key, {}).get(lang, texts.get(key, {}).get("en", "Processing error"))
@@ -124,7 +170,8 @@ def main_kb(lang):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🇮🇷 فارسی", callback_data="fa"),
          InlineKeyboardButton(text="🇬🇧 English", callback_data="en")],
-        [InlineKeyboardButton(text="⚙️ کیفیت" if lang == "fa" else "⚙️ Quality", callback_data="quality_menu")],
+        [InlineKeyboardButton(text="⚙️ کیفیت" if lang == "fa" else "⚙️ Quality", callback_data="quality_menu"),
+         InlineKeyboardButton(text="🎚️ مونو/استریو" if lang == "fa" else "🎚️ Mono/Stereo", callback_data="mono_menu")],
         [InlineKeyboardButton(text="💖 Donate", callback_data="donate", style="primary")]
     ])
 
@@ -136,6 +183,16 @@ def quality_kb(lang, current):
         buttons.append([InlineKeyboardButton(text=text, callback_data=f"quality_{qid}")])
     buttons.append([InlineKeyboardButton(text="🔙 بازگشت" if lang == "fa" else "🔙 Back", callback_data="back")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def mono_kb(lang, current_mono):
+    # current_mono: 0 for stereo, 1 for mono
+    stereo_text = "✅ استریو (Stereo)" if current_mono == 0 else "استریو (Stereo)"
+    mono_text = "✅ مونو (Mono)" if current_mono == 1 else "مونو (Mono)"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=stereo_text, callback_data="mono_0")],
+        [InlineKeyboardButton(text=mono_text, callback_data="mono_1")],
+        [InlineKeyboardButton(text="🔙 بازگشت" if lang == "fa" else "🔙 Back", callback_data="back")]
+    ])
 
 async def run_ffmpeg(cmd, step_name=""):
     process = await asyncio.create_subprocess_exec(
@@ -153,8 +210,12 @@ async def extract_audio_from_video(video_path, audio_path):
     cmd = [FFMPEG_PATH, "-i", video_path, "-q:a", "0", "-map", "a", audio_path, "-y"]
     return await run_ffmpeg(cmd, "extract_audio")
 
-async def compress_audio_async(input_path, output_path, bitrate):
-    cmd = [FFMPEG_PATH, "-i", input_path, "-b:a", bitrate, "-y", output_path]
+async def compress_audio_async(input_path, output_path, bitrate, mono_mode):
+    """فشرده‌سازی با قابلیت تبدیل به مونو"""
+    cmd = [FFMPEG_PATH, "-i", input_path, "-b:a", bitrate, "-y"]
+    if mono_mode == 1:
+        cmd.extend(["-ac", "1"])  # تبدیل به مونو (1 کانال)
+    cmd.append(output_path)
     return await run_ffmpeg(cmd, "compress_audio")
 
 @dp.message(Command("start"))
@@ -162,7 +223,8 @@ async def start(msg: types.Message):
     user_id = msg.from_user.id
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO users (user_id, lang, quality) VALUES (?, ?, ?)", (user_id, "en", "medium"))
+    cur.execute("INSERT OR IGNORE INTO users (user_id, lang, quality, mono_mode) VALUES (?, ?, ?, ?)",
+                (user_id, "en", "medium", 0))
     conn.commit()
     cur.execute("SELECT lang FROM users WHERE user_id = ?", (user_id,))
     lang = cur.fetchone()[0]
@@ -182,6 +244,18 @@ async def quality_cmd(msg: types.Message):
     await msg.answer("Select quality:" if lang == "en" else "کیفیت مورد نظر را انتخاب کنید:", 
                      reply_markup=quality_kb(lang, current))
 
+@dp.message(Command("mono"))
+async def mono_cmd(msg: types.Message):
+    user_id = msg.from_user.id
+    lang = user_lang.get(user_id, "en")
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+    cur.execute("SELECT mono_mode FROM users WHERE user_id = ?", (user_id,))
+    current = cur.fetchone()[0]
+    conn.close()
+    mode_name = "مونو (Mono)" if current == 1 else "استریو (Stereo)"
+    await msg.answer(get_text(lang, "mono_current", mode=mode_name), reply_markup=mono_kb(lang, current))
+
 @dp.message(Command("about"))
 async def about_cmd(msg: types.Message):
     user_id = msg.from_user.id
@@ -200,8 +274,8 @@ async def callback(call: types.CallbackQuery):
     data = call.data
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
-    cur.execute("SELECT lang, quality FROM users WHERE user_id = ?", (user_id,))
-    lang, quality = cur.fetchone()
+    cur.execute("SELECT lang, quality, mono_mode FROM users WHERE user_id = ?", (user_id,))
+    lang, quality, mono_mode = cur.fetchone()
     conn.close()
     user_lang[user_id] = lang
 
@@ -228,6 +302,20 @@ async def callback(call: types.CallbackQuery):
             conn.close()
             name = QUALITIES[qid]["name_fa"] if lang == "fa" else QUALITIES[qid]["name_en"]
             await call.message.edit_text(get_text(lang, "quality_set", name=name), reply_markup=main_kb(lang))
+
+    elif data == "mono_menu":
+        await call.message.edit_text("Select audio mode:" if lang == "en" else "حالت صدا را انتخاب کنید:",
+                                     reply_markup=mono_kb(lang, mono_mode))
+
+    elif data.startswith("mono_"):
+        new_mode = int(data.split("_")[1])
+        conn = sqlite3.connect(DB)
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET mono_mode = ? WHERE user_id = ?", (new_mode, user_id))
+        conn.commit()
+        conn.close()
+        mode_name = "مونو (Mono)" if new_mode == 1 else "استریو (Stereo)"
+        await call.message.edit_text(get_text(lang, "mono_set", mode=mode_name), reply_markup=main_kb(lang))
 
     elif data == "back":
         await call.message.edit_text(get_text(lang, "start"), reply_markup=main_kb(lang), parse_mode="Markdown")
@@ -260,7 +348,12 @@ async def callback(call: types.CallbackQuery):
 async def handle_media(msg: types.Message):
     user_id = msg.from_user.id
     lang = user_lang.get(user_id, "en")
-    
+
+    # بررسی محدودیت نرخ درخواست
+    if not check_rate_limit(user_id):
+        await msg.answer(get_rate_limit_message(lang))
+        return
+
     # تشخیص نوع رسانه
     is_audio = msg.audio is not None
     is_video = msg.video is not None
@@ -272,8 +365,8 @@ async def handle_media(msg: types.Message):
 
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
-    cur.execute("SELECT quality FROM users WHERE user_id = ?", (user_id,))
-    quality = cur.fetchone()[0]
+    cur.execute("SELECT quality, mono_mode FROM users WHERE user_id = ?", (user_id,))
+    quality, mono_mode = cur.fetchone()
     conn.close()
     bitrate = QUALITIES[quality]["bitrate"]
 
@@ -316,7 +409,7 @@ async def handle_media(msg: types.Message):
             await progress_msg.edit_text("⏳ [🟩🟩🟩⬜⬜] 60% - " + ("در حال فشرده‌سازی..." if lang == "fa" else "Compressing..."))
 
         output_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_out.mp3")
-        success = await compress_audio_async(audio_for_compress, output_path, bitrate)
+        success = await compress_audio_async(audio_for_compress, output_path, bitrate, mono_mode)
         if not success:
             raise Exception("Compression failed")
 
