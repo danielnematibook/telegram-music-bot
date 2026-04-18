@@ -136,21 +136,28 @@ async def save_to_cache(file_hash: str, output_path: str, size: int):
         await conn.commit()
 
 async def clean_old_cache():
-    """حذف کش‌های قدیمی‌تر از ۷ روز و فایل‌های مربوطه"""
-    week_ago = time.time() - 7 * 86400
-    async with aiosqlite.connect(DB) as conn:
-        async with conn.execute("SELECT file_hash, output_path FROM cache WHERE created_at < ?", (week_ago,)) as cur:
-            rows = await cur.fetchall()
-            for file_hash, output_path in rows:
-                if os.path.exists(output_path):
-                    try:
-                        os.remove(output_path)
-                    except:
-                        pass
-            await conn.execute("DELETE FROM cache WHERE created_at < ?", (week_ago,))
-            await conn.commit()
-            if rows:
-                logger.info(f"Cleaned {len(rows)} old cache entries")
+    """حذف کش‌های قدیمی‌تر از 7 روز و فایل‌های مربوطه (با بررسی وجود جدول)"""
+    try:
+        week_ago = time.time() - 7 * 86400
+        async with aiosqlite.connect(DB) as conn:
+            # بررسی وجود جدول cache
+            async with conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='cache'") as cur:
+                if not await cur.fetchone():
+                    return  # جدول هنوز وجود ندارد، کاری نکن
+            async with conn.execute("SELECT file_hash, output_path FROM cache WHERE created_at < ?", (week_ago,)) as cur:
+                rows = await cur.fetchall()
+                for file_hash, output_path in rows:
+                    if os.path.exists(output_path):
+                        try:
+                            os.remove(output_path)
+                        except:
+                            pass
+                await conn.execute("DELETE FROM cache WHERE created_at < ?", (week_ago,))
+                await conn.commit()
+                if rows:
+                    logger.info(f"Cleaned {len(rows)} old cache entries")
+    except Exception as e:
+        logger.error(f"Error cleaning cache: {e}")
 
 # ------------------------- متن‌ها و کیبوردها -------------------------
 QUALITIES = {
@@ -396,7 +403,6 @@ async def compress_audio_async(input_path, output_path, bitrate, mono_mode):
 
 # ------------------------- Utility: compute MD5 hash -------------------------
 async def compute_md5(file_path: str) -> str:
-    """محاسبه هش MD5 فایل به صورت غیرمسدود (با ترد جداگانه)"""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _compute_md5_sync, file_path)
 
@@ -456,13 +462,11 @@ async def process_file(item: QueueItem):
     cached = False
 
     try:
-        # دانلود فایل اصلی
         file = await bot.get_file(file_id)
         input_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_in{ext}")
         await bot.download_file(file.file_path, input_path)
         await status_msg.edit_text("⏳ [🟩⬜⬜⬜⬜] 20% - " + ("دانلود شد..." if lang == "fa" else "Downloaded..."))
 
-        # اگر ویدیو است، صدا را استخراج کن
         if is_video:
             temp_audio_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_temp_audio.mp3")
             await status_msg.edit_text("⏳ [🟩🟩⬜⬜⬜] 40% - " + ("استخراج صدا..." if lang == "fa" else "Extracting audio..."))
@@ -473,38 +477,26 @@ async def process_file(item: QueueItem):
         else:
             audio_for_compress = input_path
 
-        # محاسبه هش فایل صوتی (برای کش)
         file_hash = await compute_md5(audio_for_compress)
         cached_output = await get_cached_output(file_hash)
 
         if cached_output:
-            # استفاده از کش
             output_path = cached_output
             cached = True
             await status_msg.edit_text("⏳ [🟩🟩🟩🟩🟩] 100% - " + ("آماده ارسال (از کش)..." if lang == "fa" else "Ready from cache..."))
-            # نیازی به فشرده‌سازی نیست
         else:
-            # فشرده‌سازی جدید
             await status_msg.edit_text("⏳ [🟩🟩🟩⬜⬜] 60% - " + ("در حال فشرده‌سازی..." if lang == "fa" else "Compressing..."))
             output_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_out.mp3")
             success = await compress_audio_async(audio_for_compress, output_path, bitrate, mono_mode)
             if not success:
                 raise Exception("Compression failed")
-            # ذخیره در کش
             new_size = os.path.getsize(output_path)
             await save_to_cache(file_hash, output_path, new_size)
             await status_msg.edit_text("⏳ [🟩🟩🟩🟩🟩] 100% - " + ("آماده ارسال..." if lang == "fa" else "Ready..."))
 
-        # محاسبه درصد کاهش حجم
-        if cached:
-            # از کش آمد: حجم اصلی را از audio_for_compress بگیر
-            orig_size = os.path.getsize(audio_for_compress) / (1024*1024)
-            new_size = os.path.getsize(output_path) / (1024*1024)
-            percent = (1 - new_size/orig_size) * 100
-        else:
-            orig_size = os.path.getsize(audio_for_compress) / (1024*1024)
-            new_size = os.path.getsize(output_path) / (1024*1024)
-            percent = (1 - new_size/orig_size) * 100
+        orig_size = os.path.getsize(audio_for_compress) / (1024*1024)
+        new_size = os.path.getsize(output_path) / (1024*1024)
+        percent = (1 - new_size/orig_size) * 100
 
         await status_msg.delete()
 
@@ -519,14 +511,11 @@ async def process_file(item: QueueItem):
         await bot.send_message(chat_id, result_text)
         await bot.send_audio(chat_id, FSInputFile(output_path))
 
-        # اگر از کش استفاده شد، فایل خروجی را حذف نکن (برای دفعات بعد نگه دار)
-        # فقط فایل‌های موقت را پاک کن
     except Exception as e:
         logger.exception(f"Processing failed for user {user_id}")
         await status_msg.delete()
         await bot.send_message(chat_id, get_text(lang, "error"))
     finally:
-        # پاکسازی فایل‌های موقت (ورودی و temp) – فایل خروجی کش را نگه دار
         for f in [input_path, temp_audio_path]:
             if f and os.path.exists(f):
                 try:
@@ -561,7 +550,7 @@ async def on_bot_chat_member_update(update: types.ChatMemberUpdated):
         await bot.send_message(chat.id, welcome_text, parse_mode="Markdown")
         logger.info(f"Sent welcome message to group {chat.id}")
 
-# ------------------------- پاکسازی فایل‌های اورفان و کش قدیمی -------------------------
+# ------------------------- پاکسازی فایل‌های اورفان -------------------------
 def clean_orphaned_files():
     now = time.time()
     deleted = 0
@@ -739,7 +728,6 @@ async def handle_media(msg: types.Message, is_command: bool = False):
     user = await get_user(user_id)
     lang = user["lang"]
 
-    # تشخیص نوع رسانه
     is_audio = msg.audio is not None
     is_video = msg.video is not None
     is_document_audio = (msg.document and msg.document.mime_type and msg.document.mime_type.startswith('audio/'))
@@ -748,7 +736,6 @@ async def handle_media(msg: types.Message, is_command: bool = False):
     if not (is_audio or is_video or is_document_audio or is_document_video):
         return
 
-    # بررسی محدودیت حجم فایل
     if msg.audio:
         file_size = msg.audio.file_size
     elif msg.video:
@@ -763,12 +750,10 @@ async def handle_media(msg: types.Message, is_command: bool = False):
         await msg.reply(get_text(lang, "file_too_large", size=size_mb))
         return
 
-    # بررسی محدودیت نرخ درخواست
     if not check_rate_limit(user_id):
         await msg.reply(get_rate_limit_message(lang))
         return
 
-    # حالت گروه (بدون دستور مستقیم)
     if is_group and not is_command:
         if not await is_bot_admin(chat_id):
             await msg.reply(get_text(lang, "group_not_admin"))
@@ -809,7 +794,6 @@ async def handle_media(msg: types.Message, is_command: bool = False):
         )
         return
 
-    # حالت خصوصی یا دستور /compress در گروه
     quality = user["quality"]
     mono_mode = user["mono_mode"]
 
@@ -850,19 +834,15 @@ async def handle_media(msg: types.Message, is_command: bool = False):
 
 # ------------------------- Main -------------------------
 async def main():
-    # پاکسازی فایل‌های اورفان و کش قدیمی
     clean_orphaned_files()
-    await clean_old_cache()  # حذف کش‌های قدیمی از دیتابیس و فایل
-    await init_db()
-    # تسک پاکسازی درخواست‌های گروه
+    await init_db()  # ابتدا دیتابیس و جدول‌ها ساخته شوند
+    await clean_old_cache()  # سپس کش قدیمی را پاک کن (اگر جدول وجود داشته باشد)
     asyncio.create_task(cleanup_pending_requests())
-    # تسک پاکسازی خودکار کش هر ۲۴ ساعت
     async def periodic_cache_clean():
         while True:
-            await asyncio.sleep(86400)  # 24 ساعت
+            await asyncio.sleep(86400)
             await clean_old_cache()
     asyncio.create_task(periodic_cache_clean())
-    # کارگرهای صف
     workers = [asyncio.create_task(queue_worker()) for _ in range(WORKERS_COUNT)]
     await dp.start_polling(bot)
     for w in workers:
