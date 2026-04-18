@@ -40,9 +40,9 @@ if FFMPEG_PATH is None:
 logger.info(f"FFmpeg at {FFMPEG_PATH}")
 
 # ------------------------- محدودیت حجم فایل -------------------------
-MAX_FILE_SIZE = 70 * 1024 * 1024  # 70 مگابایت
+MAX_FILE_SIZE = 70 * 1024 * 1024  # 70 مگابایت (برای فایل صوتی نهایی و ورودی صوتی)
 
-# ------------------------- Rate Limiting (in-memory) -------------------------
+# ------------------------- Rate Limiting -------------------------
 request_history = defaultdict(list)
 RATE_LIMIT = 5
 RATE_WINDOW = 60
@@ -61,7 +61,7 @@ def get_rate_limit_message(lang: str) -> str:
     else:
         return f"⏳ You have exceeded the rate limit ({RATE_LIMIT} files per minute). Please wait a moment."
 
-# ------------------------- Database (aiosqlite) with cache -------------------------
+# ------------------------- Database -------------------------
 async def init_db():
     async with aiosqlite.connect(DB) as conn:
         await conn.execute("""
@@ -115,14 +115,11 @@ async def update_user_mono(user_id: int, mono_mode: int):
 
 async def get_cached_output(file_hash: str) -> str | None:
     async with aiosqlite.connect(DB) as conn:
-        async with conn.execute(
-            "SELECT output_path FROM cache WHERE file_hash = ?", (file_hash,)
-        ) as cur:
+        async with conn.execute("SELECT output_path FROM cache WHERE file_hash = ?", (file_hash,)) as cur:
             row = await cur.fetchone()
             if row and os.path.exists(row[0]):
                 return row[0]
             elif row:
-                # فایل وجود ندارد، رکورد خراب است
                 await conn.execute("DELETE FROM cache WHERE file_hash = ?", (file_hash,))
                 await conn.commit()
             return None
@@ -136,14 +133,12 @@ async def save_to_cache(file_hash: str, output_path: str, size: int):
         await conn.commit()
 
 async def clean_old_cache():
-    """حذف کش‌های قدیمی‌تر از 7 روز و فایل‌های مربوطه (با بررسی وجود جدول)"""
     try:
         week_ago = time.time() - 7 * 86400
         async with aiosqlite.connect(DB) as conn:
-            # بررسی وجود جدول cache
             async with conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='cache'") as cur:
                 if not await cur.fetchone():
-                    return  # جدول هنوز وجود ندارد، کاری نکن
+                    return
             async with conn.execute("SELECT file_hash, output_path FROM cache WHERE created_at < ?", (week_ago,)) as cur:
                 rows = await cur.fetchall()
                 for file_hash, output_path in rows:
@@ -159,7 +154,7 @@ async def clean_old_cache():
     except Exception as e:
         logger.error(f"Error cleaning cache: {e}")
 
-# ------------------------- متن‌ها و کیبوردها -------------------------
+# ------------------------- Texts -------------------------
 QUALITIES = {
     "low": {"bitrate": "32k", "name_fa": "خیلی کم حجم", "name_en": "Very low"},
     "medium": {"bitrate": "64k", "name_fa": "معمولی", "name_en": "Medium"},
@@ -190,160 +185,62 @@ def get_text(lang, key, **kwargs):
                   "/about - About bot\n"
                   "/help - Help"
         },
-        "queued": {
-            "fa": "⏳ درخواست شما در صف قرار گرفت. لطفاً منتظر بمانید...",
-            "en": "⏳ Your request has been queued. Please wait..."
-        },
-        "processing": {"fa": "⏳ در حال پردازش... لطفاً صبر کنید", "en": "⏳ Processing... Please wait"},
+        "queued": {"fa": "⏳ درخواست شما در صف قرار گرفت...", "en": "⏳ Your request has been queued..."},
+        "processing": {"fa": "⏳ در حال پردازش...", "en": "⏳ Processing..."},
         "done": {"fa": "✅ فشرده‌سازی انجام شد\n📉 کاهش حجم: {percent:.1f}%", "en": "✅ Done\n📉 Reduction: {percent:.1f}%"},
         "error": {"fa": "❌ خطا در پردازش", "en": "❌ Error"},
         "quality_set": {"fa": "کیفیت به {name} تغییر کرد", "en": "Quality set to {name}"},
-        "mono_set": {
-            "fa": "حالت پخش به **{mode}** تغییر کرد.\n(حالت مونو حجم فایل را تا ۴۰٪ کاهش می‌دهد)",
-            "en": "Audio mode changed to **{mode}**.\n(Mono mode reduces file size up to 40%)"
-        },
-        "mono_current": {
-            "fa": "حالت فعلی: {mode}",
-            "en": "Current mode: {mode}"
-        },
-        "about": {
-            "fa": "🤖 ربات فشرده‌ساز موزیک\nنسخه 2.7\n\n"
-                  "قابلیت‌ها:\n"
-                  "• فشرده‌سازی فایل‌های صوتی\n"
-                  "• استخراج صدا از ویدیو و فشرده‌سازی\n"
-                  "• تبدیل استریو به مونو\n"
-                  "• صف پردازش (مدیریت همزمان)\n"
-                  "• پشتیبانی از گروه‌ها (با ادمین)\n"
-                  "• محدودیت حجم فایل: ۷۰ مگابایت\n"
-                  "• کش نتایج (پردازش سریع فایل‌های تکراری)\n\n"
-                  "ساخته شده با aiogram 3 و FFmpeg",
-            "en": "🤖 Music Compressor Bot\nVersion 2.7\n\n"
-                  "Features:\n"
-                  "• Compress audio files\n"
-                  "• Extract audio from video and compress\n"
-                  "• Stereo to mono conversion\n"
-                  "• Processing queue\n"
-                  "• Group support (requires admin)\n"
-                  "• File size limit: 70 MB\n"
-                  "• Result caching (fast repeated processing)\n\n"
-                  "Built with aiogram 3 and FFmpeg"
-        },
-        "help": {
-            "fa": "📖 **راهنما:**\n\n"
-                  "1️⃣ **فایل صوتی:**\n"
-                  "   یک فایل صوتی (mp3, m4a, ogg, wav) ارسال کنید، ربات آن را فشرده می‌کند.\n\n"
-                  "2️⃣ **فایل ویدیویی:**\n"
-                  "   یک فایل ویدیویی (mp4, mkv, avi, mov) ارسال کنید، ربات صدای آن را استخراج کرده، فشرده می‌کند و برای شما ارسال می‌کند.\n\n"
-                  "3️⃣ **تنظیم کیفیت:**\n"
-                  "   از دستور /quality برای تنظیم کیفیت فشرده‌سازی استفاده کنید.\n\n"
-                  "4️⃣ **تبدیل به مونو:**\n"
-                  "   از دستور /mono برای کاهش حجم بیشتر (مناسب پادکست و کتاب صوتی) استفاده کنید.\n\n"
-                  "5️⃣ **استفاده در گروه:**\n"
-                  "   ربات را به گروه اضافه کنید و به او نقش ادمین بدهید. سپس کاربران می‌توانند فایل ارسال کنند و با کلیک روی دکمه «فشرده‌سازی» فایل فشرده را دریافت کنند.\n\n"
-                  f"📦 محدودیت حجم فایل: ۷۰ مگابایت\n"
-                  f"⏳ محدودیت نرخ درخواست: {RATE_LIMIT} فایل در دقیقه\n"
-                  "🔄 صف پردازش خودکار برای مدیریت همزمان درخواست‌ها\n"
-                  "💾 کش نتایج: فایل‌های تکراری سریعتر پردازش می‌شوند",
-            "en": "📖 **Help:**\n\n"
-                  "1️⃣ **Audio File:**\n"
-                  "   Send an audio file (mp3, m4a, ogg, wav), the bot will compress it.\n\n"
-                  "2️⃣ **Video File:**\n"
-                  "   Send a video file (mp4, mkv, avi, mov), the bot will extract its audio, compress it and send back.\n\n"
-                  "3️⃣ **Quality Settings:**\n"
-                  "   Use /quality command to set compression quality.\n\n"
-                  "4️⃣ **Mono Mode:**\n"
-                  "   Use /mono command to reduce file size further (ideal for podcasts and audiobooks).\n\n"
-                  "5️⃣ **Group Usage:**\n"
-                  "   Add bot to group and give it admin rights. Then users can send files and click 'Compress' button to get compressed file.\n\n"
-                  f"📦 File size limit: 70 MB\n"
-                  f"⏳ Rate limit: {RATE_LIMIT} files per minute\n"
-                  "🔄 Auto queue for concurrent requests\n"
-                  "💾 Result caching: repeated files processed faster"
-        },
-        "group_not_admin": {
-            "fa": "⚠️ ربات در این گروه ادمین نیست. لطفاً ابتدا ربات را ادمین کنید تا بتواند فایل‌ها را پردازش کند.",
-            "en": "⚠️ Bot is not admin in this group. Please make bot admin first to process files."
-        },
-        "group_confirm": {
-            "fa": "🎵 فایل صوتی دریافت شد. آیا می‌خواهید آن را فشرده کنید؟",
-            "en": "🎵 Audio file received. Do you want to compress it?"
-        },
-        "group_canceled": {
-            "fa": "❌ عملیات فشرده‌سازی لغو شد.",
-            "en": "❌ Compression canceled."
-        },
-        "group_expired": {
-            "fa": "⏰ زمان درخواست شما منقضی شده است. لطفاً دوباره فایل را ارسال کنید.",
-            "en": "⏰ Your request has expired. Please send the file again."
-        },
-        "group_result": {
-            "fa": "👤 کاربر {name}:\n✅ فشرده‌سازی انجام شد\n📉 کاهش حجم: {percent:.1f}%",
-            "en": "👤 User {name}:\n✅ Compression done\n📉 Reduction: {percent:.1f}%"
-        },
-        "file_too_large": {
-            "fa": "❌ حجم فایل ارسالی نباید بیشتر از ۷۰ مگابایت باشد.\nحجم فایل شما: {size:.1f} مگابایت",
-            "en": "❌ File size cannot exceed 70 MB.\nYour file size: {size:.1f} MB"
-        },
-        "welcome_group": {
-            "fa": "🎉 به گروه خوش آمدید!\n\nربات فشرده‌ساز موزیک با موفقیت به این گروه اضافه شد.\n\n📖 **نحوه استفاده:**\n"
-                  "• یک فایل صوتی یا ویدیویی ارسال کنید.\n"
-                  "• ربات یک دکمه «فشرده‌سازی» نشان می‌دهد.\n"
-                  "• روی آن کلیک کنید تا فایل فشرده شود.\n\n"
-                  "• همچنین می‌توانید روی فایل ریپلی کنید و دستور /compress را بفرستید.\n\n"
-                  "برای اطلاعات بیشتر از دستور /help استفاده کنید.\n\n"
-                  "موفق باشید! 🚀",
-            "en": "🎉 Welcome to the group!\n\nMusic Compressor Bot has been successfully added to this group.\n\n📖 **How to use:**\n"
-                  "• Send an audio or video file.\n"
-                  "• The bot will show a 'Compress' button.\n"
-                  "• Click it to get the compressed file.\n\n"
-                  "• Alternatively, reply to the file with /compress.\n\n"
-                  "Use /help for more information.\n\n"
-                  "Enjoy! 🚀"
-        },
-        "cache_hit": {
-            "fa": "💾 این فایل قبلاً فشرده شده بود. ارسال از کش...",
-            "en": "💾 This file was already compressed. Sending from cache..."
-        }
+        "mono_set": {"fa": "حالت پخش به **{mode}** تغییر کرد.\n(حالت مونو حجم فایل را تا ۴۰٪ کاهش می‌دهد)", "en": "Audio mode changed to **{mode}**.\n(Mono mode reduces file size up to 40%)"},
+        "mono_current": {"fa": "حالت فعلی: {mode}", "en": "Current mode: {mode}"},
+        "about": {"fa": "🤖 ربات فشرده‌ساز موزیک\nنسخه 2.8", "en": "🤖 Music Compressor Bot\nVersion 2.8"},
+        "help": {"fa": "📖 راهنما...", "en": "📖 Help..."},
+        "group_not_admin": {"fa": "⚠️ ربات ادمین نیست", "en": "⚠️ Bot not admin"},
+        "group_confirm": {"fa": "🎵 فایل دریافت شد. فشرده شود؟", "en": "🎵 Compress this file?"},
+        "group_canceled": {"fa": "❌ لغو شد", "en": "❌ Canceled"},
+        "group_expired": {"fa": "⏰ منقضی شد", "en": "⏰ Expired"},
+        "group_result": {"fa": "👤 کاربر {name}:\n✅ کاهش {percent:.1f}%", "en": "👤 User {name}:\n✅ Reduced {percent:.1f}%"},
+        "file_too_large": {"fa": "❌ حجم فایل صوتی نباید بیشتر از ۷۰ مگابایت باشد.\nحجم: {size:.1f} MB", "en": "❌ Audio size cannot exceed 70 MB.\nSize: {size:.1f} MB"},
+        "welcome_group": {"fa": "🎉 ربات اضافه شد!", "en": "🎉 Bot added!"},
+        "cache_hit": {"fa": "💾 ارسال از کش...", "en": "💾 Sending from cache..."}
     }
     txt = texts.get(key, {}).get(lang, texts.get(key, {}).get("en", "Processing error"))
     return txt.format(**kwargs) if kwargs else txt
 
+# ------------------------- Keyboards -------------------------
 def main_kb(lang):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🇮🇷 فارسی", callback_data="fa"),
          InlineKeyboardButton(text="🇬🇧 English", callback_data="en")],
-        [InlineKeyboardButton(text="⚙️ کیفیت" if lang == "fa" else "⚙️ Quality", callback_data="quality_menu"),
-         InlineKeyboardButton(text="🎚️ مونو/استریو" if lang == "fa" else "🎚️ Mono/Stereo", callback_data="mono_menu")],
+        [InlineKeyboardButton(text="⚙️ کیفیت" if lang=="fa" else "⚙️ Quality", callback_data="quality_menu"),
+         InlineKeyboardButton(text="🎚️ مونو/استریو" if lang=="fa" else "🎚️ Mono/Stereo", callback_data="mono_menu")],
         [InlineKeyboardButton(text="💖 Donate", callback_data="donate", style="primary")]
     ])
 
 def quality_kb(lang, current):
     buttons = []
     for qid, q in QUALITIES.items():
-        name = q["name_fa"] if lang == "fa" else q["name_en"]
-        text = f"{'✅ ' if qid == current else ''}{name}"
+        name = q["name_fa"] if lang=="fa" else q["name_en"]
+        text = f"{'✅ ' if qid==current else ''}{name}"
         buttons.append([InlineKeyboardButton(text=text, callback_data=f"quality_{qid}")])
-    buttons.append([InlineKeyboardButton(text="🔙 بازگشت" if lang == "fa" else "🔙 Back", callback_data="back")])
+    buttons.append([InlineKeyboardButton(text="🔙 بازگشت" if lang=="fa" else "🔙 Back", callback_data="back")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def mono_kb(lang, current_mono):
-    stereo_text = "✅ استریو (Stereo)" if current_mono == 0 else "استریو (Stereo)"
-    mono_text = "✅ مونو (Mono)" if current_mono == 1 else "مونو (Mono)"
+    stereo_text = "✅ استریو (Stereo)" if current_mono==0 else "استریو (Stereo)"
+    mono_text = "✅ مونو (Mono)" if current_mono==1 else "مونو (Mono)"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=stereo_text, callback_data="mono_0")],
         [InlineKeyboardButton(text=mono_text, callback_data="mono_1")],
-        [InlineKeyboardButton(text="🔙 بازگشت" if lang == "fa" else "🔙 Back", callback_data="back")]
+        [InlineKeyboardButton(text="🔙 بازگشت" if lang=="fa" else "🔙 Back", callback_data="back")]
     ])
 
 def group_confirm_kb(request_id: str, lang: str):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ فشرده‌سازی" if lang == "fa" else "✅ Compress", callback_data=f"group_compress_{request_id}"),
-            InlineKeyboardButton(text="❌ انصراف" if lang == "fa" else "❌ Cancel", callback_data=f"group_cancel_{request_id}")
-        ]
+        [InlineKeyboardButton(text="✅ فشرده‌سازی" if lang=="fa" else "✅ Compress", callback_data=f"group_compress_{request_id}"),
+         InlineKeyboardButton(text="❌ انصراف" if lang=="fa" else "❌ Cancel", callback_data=f"group_cancel_{request_id}")]
     ])
 
-# ------------------------- Group pending requests (با Lock) -------------------------
+# ------------------------- Group pending -------------------------
 group_pending = {}
 group_pending_lock = asyncio.Lock()
 PENDING_EXPIRE_SECONDS = 300
@@ -357,24 +254,17 @@ async def cleanup_pending_requests():
                 for rid in expired:
                     req = group_pending.pop(rid)
                     try:
-                        await bot.edit_message_text(
-                            chat_id=req["chat_id"],
-                            message_id=req["message_id"],
-                            text=get_text(req["lang"], "group_expired")
-                        )
-                    except Exception:
+                        await bot.edit_message_text(chat_id=req["chat_id"], message_id=req["message_id"],
+                                                    text=get_text(req["lang"], "group_expired"))
+                    except:
                         pass
         except Exception as e:
             logger.error(f"Cleanup error: {e}")
         await asyncio.sleep(60)
 
-# ------------------------- FFmpeg helpers با timeout -------------------------
+# ------------------------- FFmpeg helpers -------------------------
 async def run_ffmpeg(cmd, step_name=""):
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
-    )
+    process = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         _, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
         if process.returncode != 0:
@@ -401,7 +291,7 @@ async def compress_audio_async(input_path, output_path, bitrate, mono_mode):
     cmd.append(output_path)
     return await run_ffmpeg(cmd, "compress_audio")
 
-# ------------------------- Utility: compute MD5 hash -------------------------
+# ------------------------- Utility -------------------------
 async def compute_md5(file_path: str) -> str:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _compute_md5_sync, file_path)
@@ -413,7 +303,7 @@ def _compute_md5_sync(file_path: str) -> str:
             hasher.update(chunk)
     return hasher.hexdigest()
 
-# ------------------------- Processing Queue (با maxsize و کش) -------------------------
+# ------------------------- Processing Queue -------------------------
 @dataclass
 class QueueItem:
     user_id: int
@@ -432,7 +322,7 @@ WORKERS_COUNT = 3
 
 async def queue_worker():
     while True:
-        item: QueueItem = await processing_queue.get()
+        item = await processing_queue.get()
         try:
             await process_file(item)
         except Exception as e:
@@ -452,24 +342,22 @@ async def process_file(item: QueueItem):
     is_group = (chat_id != user_id)
 
     bitrate = QUALITIES[quality]["bitrate"]
-
     status_msg = await bot.send_message(chat_id, get_text(lang, "processing"), reply_to_message_id=item.reply_to_message_id)
 
     input_path = None
     temp_audio_path = None
     output_path = None
     audio_for_compress = None
-    cached = False
 
     try:
         file = await bot.get_file(file_id)
         input_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_in{ext}")
         await bot.download_file(file.file_path, input_path)
-        await status_msg.edit_text("⏳ [🟩⬜⬜⬜⬜] 20% - " + ("دانلود شد..." if lang == "fa" else "Downloaded..."))
+        await status_msg.edit_text("⏳ [🟩⬜⬜⬜⬜] 20% - " + ("دانلود شد..." if lang=="fa" else "Downloaded..."))
 
         if is_video:
             temp_audio_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_temp_audio.mp3")
-            await status_msg.edit_text("⏳ [🟩🟩⬜⬜⬜] 40% - " + ("استخراج صدا..." if lang == "fa" else "Extracting audio..."))
+            await status_msg.edit_text("⏳ [🟩🟩⬜⬜⬜] 40% - " + ("استخراج صدا..." if lang=="fa" else "Extracting audio..."))
             success = await extract_audio_from_video(input_path, temp_audio_path)
             if not success:
                 raise Exception("Audio extraction failed")
@@ -477,40 +365,47 @@ async def process_file(item: QueueItem):
         else:
             audio_for_compress = input_path
 
+        # بررسی حجم فایل صوتی (نهایی قبل از فشرده‌سازی)
+        audio_size_mb = os.path.getsize(audio_for_compress) / (1024*1024)
+        if audio_size_mb > 70:
+            await status_msg.delete()
+            await bot.send_message(chat_id, get_text(lang, "file_too_large", size=audio_size_mb))
+            # پاکسازی فایل‌های موقت
+            for f in [input_path, temp_audio_path]:
+                if f and os.path.exists(f):
+                    os.remove(f)
+            return
+
         file_hash = await compute_md5(audio_for_compress)
         cached_output = await get_cached_output(file_hash)
 
         if cached_output:
             output_path = cached_output
-            cached = True
-            await status_msg.edit_text("⏳ [🟩🟩🟩🟩🟩] 100% - " + ("آماده ارسال (از کش)..." if lang == "fa" else "Ready from cache..."))
+            await status_msg.edit_text("⏳ [🟩🟩🟩🟩🟩] 100% - " + ("آماده (از کش)..." if lang=="fa" else "Ready (cached)..."))
         else:
-            await status_msg.edit_text("⏳ [🟩🟩🟩⬜⬜] 60% - " + ("در حال فشرده‌سازی..." if lang == "fa" else "Compressing..."))
+            await status_msg.edit_text("⏳ [🟩🟩🟩⬜⬜] 60% - " + ("در حال فشرده‌سازی..." if lang=="fa" else "Compressing..."))
             output_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_out.mp3")
             success = await compress_audio_async(audio_for_compress, output_path, bitrate, mono_mode)
             if not success:
                 raise Exception("Compression failed")
-            new_size = os.path.getsize(output_path)
-            await save_to_cache(file_hash, output_path, new_size)
-            await status_msg.edit_text("⏳ [🟩🟩🟩🟩🟩] 100% - " + ("آماده ارسال..." if lang == "fa" else "Ready..."))
+            await save_to_cache(file_hash, output_path, os.path.getsize(output_path))
+            await status_msg.edit_text("⏳ [🟩🟩🟩🟩🟩] 100% - " + ("آماده ارسال..." if lang=="fa" else "Ready..."))
 
         orig_size = os.path.getsize(audio_for_compress) / (1024*1024)
         new_size = os.path.getsize(output_path) / (1024*1024)
         percent = (1 - new_size/orig_size) * 100
 
         await status_msg.delete()
-
-        if cached:
+        if cached_output:
             await bot.send_message(chat_id, get_text(lang, "cache_hit"))
-
         if is_group and item.requester_name:
             result_text = get_text(lang, "group_result", name=item.requester_name, percent=percent)
         else:
             result_text = get_text(lang, "done", percent=percent)
-
         await bot.send_message(chat_id, result_text)
         await bot.send_audio(chat_id, FSInputFile(output_path))
 
+        # فایل خروجی اگر از کش نیامده بود، برای کش نگه می‌داریم. فقط فایل‌های موقت پاک شوند.
     except Exception as e:
         logger.exception(f"Processing failed for user {user_id}")
         await status_msg.delete()
@@ -520,20 +415,19 @@ async def process_file(item: QueueItem):
             if f and os.path.exists(f):
                 try:
                     os.remove(f)
-                except Exception:
+                except:
                     pass
 
-# ------------------------- Helper: check bot admin in group -------------------------
+# ------------------------- Helper -------------------------
 async def is_bot_admin(chat_id: int) -> bool:
     try:
         bot_member = await bot.get_chat_member(chat_id, bot.id)
         return bot_member.status in ["administrator", "creator"]
-    except Exception:
+    except:
         return False
 
-# ------------------------- Auto welcome when bot added to group -------------------------
+# ------------------------- Auto welcome -------------------------
 welcomed_groups = set()
-
 @dp.my_chat_member()
 async def on_bot_chat_member_update(update: types.ChatMemberUpdated):
     chat = update.chat
@@ -546,65 +440,35 @@ async def on_bot_chat_member_update(update: types.ChatMemberUpdated):
         if chat.id in welcomed_groups:
             return
         welcomed_groups.add(chat.id)
-        welcome_text = get_text("en", "welcome_group")
-        await bot.send_message(chat.id, welcome_text, parse_mode="Markdown")
+        await bot.send_message(chat.id, get_text("en", "welcome_group"), parse_mode="Markdown")
         logger.info(f"Sent welcome message to group {chat.id}")
 
-# ------------------------- پاکسازی فایل‌های اورفان -------------------------
-def clean_orphaned_files():
-    now = time.time()
-    deleted = 0
-    for filename in os.listdir(DOWNLOAD_DIR):
-        filepath = os.path.join(DOWNLOAD_DIR, filename)
-        if os.path.isfile(filepath):
-            if now - os.path.getmtime(filepath) > 86400:  # 24 ساعت
-                try:
-                    os.remove(filepath)
-                    deleted += 1
-                except Exception:
-                    pass
-    if deleted:
-        logger.info(f"Cleaned up {deleted} orphaned files")
-
-# ------------------------- Bot Handlers -------------------------
+# ------------------------- Handlers -------------------------
 @dp.message(Command("start"))
 async def start(msg: types.Message):
-    user_id = msg.from_user.id
-    user = await get_user(user_id)
-    lang = user["lang"]
-    await msg.answer(get_text(lang, "start"), reply_markup=main_kb(lang), parse_mode="Markdown")
+    user = await get_user(msg.from_user.id)
+    await msg.answer(get_text(user["lang"], "start"), reply_markup=main_kb(user["lang"]), parse_mode="Markdown")
 
 @dp.message(Command("quality"))
 async def quality_cmd(msg: types.Message):
-    user_id = msg.from_user.id
-    user = await get_user(user_id)
-    lang = user["lang"]
-    current = user["quality"]
-    await msg.answer("Select quality:" if lang == "en" else "کیفیت مورد نظر را انتخاب کنید:", 
-                     reply_markup=quality_kb(lang, current))
+    user = await get_user(msg.from_user.id)
+    await msg.answer("Select quality:" if user["lang"]=="en" else "کیفیت:", reply_markup=quality_kb(user["lang"], user["quality"]))
 
 @dp.message(Command("mono"))
 async def mono_cmd(msg: types.Message):
-    user_id = msg.from_user.id
-    user = await get_user(user_id)
-    lang = user["lang"]
-    current = user["mono_mode"]
-    mode_name = "مونو (Mono)" if current == 1 else "استریو (Stereo)"
-    await msg.answer(get_text(lang, "mono_current", mode=mode_name), reply_markup=mono_kb(lang, current))
+    user = await get_user(msg.from_user.id)
+    mode_name = "مونو (Mono)" if user["mono_mode"]==1 else "استریو (Stereo)"
+    await msg.answer(get_text(user["lang"], "mono_current", mode=mode_name), reply_markup=mono_kb(user["lang"], user["mono_mode"]))
 
 @dp.message(Command("about"))
 async def about_cmd(msg: types.Message):
-    user_id = msg.from_user.id
-    user = await get_user(user_id)
-    lang = user["lang"]
-    await msg.answer(get_text(lang, "about"), reply_markup=main_kb(lang), parse_mode="Markdown")
+    user = await get_user(msg.from_user.id)
+    await msg.answer(get_text(user["lang"], "about"), reply_markup=main_kb(user["lang"]), parse_mode="Markdown")
 
 @dp.message(Command("help"))
 async def help_cmd(msg: types.Message):
-    user_id = msg.from_user.id
-    user = await get_user(user_id)
-    lang = user["lang"]
-    await msg.answer(get_text(lang, "help"), reply_markup=main_kb(lang), parse_mode="Markdown")
+    user = await get_user(msg.from_user.id)
+    await msg.answer(get_text(user["lang"], "help"), reply_markup=main_kb(user["lang"]), parse_mode="Markdown")
 
 @dp.callback_query()
 async def callback(call: types.CallbackQuery):
@@ -612,99 +476,66 @@ async def callback(call: types.CallbackQuery):
     data = call.data
     user = await get_user(user_id)
     lang = user["lang"]
-    quality = user["quality"]
-    mono_mode = user["mono_mode"]
 
-    # پردازش دکمه‌های گروه
     if data.startswith("group_compress_"):
-        request_id = data.split("_")[2]
+        req_id = data.split("_")[2]
         async with group_pending_lock:
-            req = group_pending.get(request_id)
-            if not req:
-                await call.answer(get_text(lang, "group_expired"), show_alert=True)
+            req = group_pending.get(req_id)
+            if not req or req["user_id"] != user_id:
+                await call.answer(get_text(lang, "group_expired") if not req else "Not yours", show_alert=True)
                 await call.message.delete()
                 return
-            if req["user_id"] != user_id:
-                await call.answer("این دکمه متعلق به شما نیست.", show_alert=True)
-                return
-            group_pending.pop(request_id)
+            group_pending.pop(req_id)
         await call.message.delete()
         user = await get_user(user_id)
         item = QueueItem(
-            user_id=user_id,
-            lang=req["lang"],
-            file_id=req["file_id"],
-            quality=user["quality"],
-            mono_mode=user["mono_mode"],
-            is_video=req["is_video"],
-            ext=req["ext"],
-            chat_id=req["chat_id"],
-            reply_to_message_id=req["message_id"],
-            requester_name=call.from_user.full_name
+            user_id=user_id, lang=req["lang"], file_id=req["file_id"],
+            quality=user["quality"], mono_mode=user["mono_mode"],
+            is_video=req["is_video"], ext=req["ext"], chat_id=req["chat_id"],
+            reply_to_message_id=req["message_id"], requester_name=call.from_user.full_name
         )
         try:
             await processing_queue.put(item)
+            await call.answer("Added to queue")
+            await bot.send_message(req["chat_id"], get_text(req["lang"], "queued"), reply_to_message_id=req["message_id"])
         except asyncio.QueueFull:
-            await call.answer("صف پردازش پر است، لحظاتی دیگر تلاش کنید.", show_alert=True)
-            return
-        await call.answer("درخواست شما به صف اضافه شد.", show_alert=False)
-        await bot.send_message(req["chat_id"], get_text(req["lang"], "queued"), reply_to_message_id=req["message_id"])
+            await call.answer("Queue full, try later", show_alert=True)
         return
 
-    elif data.startswith("group_cancel_"):
-        request_id = data.split("_")[2]
+    if data.startswith("group_cancel_"):
+        req_id = data.split("_")[2]
         async with group_pending_lock:
-            req = group_pending.get(request_id)
+            req = group_pending.get(req_id)
             if req and req["user_id"] == user_id:
-                group_pending.pop(request_id)
+                group_pending.pop(req_id)
                 await call.message.edit_text(get_text(req["lang"], "group_canceled"))
         await call.answer()
         return
 
-    # دکمه‌های عادی
+    # normal buttons
     if data in ["fa", "en"]:
         await update_user_lang(user_id, data)
         await call.message.edit_text(get_text(data, "start"), reply_markup=main_kb(data), parse_mode="Markdown")
     elif data == "quality_menu":
-        await call.message.edit_text("Select quality:" if lang == "en" else "کیفیت مورد نظر را انتخاب کنید:", 
-                                     reply_markup=quality_kb(lang, quality))
+        await call.message.edit_text("Select quality:", reply_markup=quality_kb(lang, user["quality"]))
     elif data.startswith("quality_"):
         qid = data.split("_")[1]
         if qid in QUALITIES:
             await update_user_quality(user_id, qid)
-            name = QUALITIES[qid]["name_fa"] if lang == "fa" else QUALITIES[qid]["name_en"]
+            name = QUALITIES[qid]["name_fa"] if lang=="fa" else QUALITIES[qid]["name_en"]
             await call.message.edit_text(get_text(lang, "quality_set", name=name), reply_markup=main_kb(lang))
     elif data == "mono_menu":
-        await call.message.edit_text("Select audio mode:" if lang == "en" else "حالت صدا را انتخاب کنید:",
-                                     reply_markup=mono_kb(lang, mono_mode))
+        await call.message.edit_text("Select mode:", reply_markup=mono_kb(lang, user["mono_mode"]))
     elif data.startswith("mono_"):
         new_mode = int(data.split("_")[1])
         await update_user_mono(user_id, new_mode)
-        mode_name = "مونو (Mono)" if new_mode == 1 else "استریو (Stereo)"
+        mode_name = "Mono" if new_mode==1 else "Stereo"
         await call.message.edit_text(get_text(lang, "mono_set", mode=mode_name), reply_markup=main_kb(lang))
     elif data == "back":
         await call.message.edit_text(get_text(lang, "start"), reply_markup=main_kb(lang), parse_mode="Markdown")
     elif data == "donate":
-        if lang == "fa":
-            donate_text = (
-                "💖 این ربات به رایگان در اختیار شما قرار گرفته است اما برای بقای این پروژه می‌توانید از ما حمایت مالی کنید:\n\n"
-                "**شبکه Ton:**\n"
-                "`UQCv_m88yafoOWMD9h9MMglPP3DSiBL5xbLiU7akxWs5Q0pk`\n\n"
-                "**شبکه TRC20 (USDT)**\n"
-                "`THXUWRaBgEyC27e8xC9JWG7unvygkFGNov`\n\n"
-                "سازنده: Daniel Nemati"
-            )
-        else:
-            donate_text = (
-                "💖 This bot is provided to you for free, but to support the continuation of this project, you can donate:\n\n"
-                "**Ton Network:**\n"
-                "`UQCv_m88yafoOWMD9h9MMglPP3DSiBL5xbLiU7akxWs5Q0pk`\n\n"
-                "**USDT TRC20**\n"
-                "`THXUWRaBgEyC27e8xC9JWG7unvygkFGNov`\n\n"
-                "Creator: Daniel Nemati"
-            )
+        donate_text = "💖 Ton: `UQCv_m88yafoOWMD9h9MMglPP3DSiBL5xbLiU7akxWs5Q0pk`\nUSDT TRC20: `THXUWRaBgEyC27e8xC9JWG7unvygkFGNov`"
         await call.message.answer(donate_text, parse_mode="MarkdownV2")
-        await call.answer()
     await call.answer()
 
 @dp.message(Command("compress"))
@@ -716,15 +547,13 @@ async def compress_command(msg: types.Message):
         await handle_media(msg.reply_to_message, is_command=True)
     else:
         user = await get_user(msg.from_user.id)
-        lang = user["lang"]
-        await msg.reply(get_text(lang, "help")[:200])
+        await msg.reply(get_text(user["lang"], "help")[:200])
 
 @dp.message()
 async def handle_media(msg: types.Message, is_command: bool = False):
     user_id = msg.from_user.id
     chat_id = msg.chat.id
     is_group = chat_id < 0
-
     user = await get_user(user_id)
     lang = user["lang"]
 
@@ -736,19 +565,14 @@ async def handle_media(msg: types.Message, is_command: bool = False):
     if not (is_audio or is_video or is_document_audio or is_document_video):
         return
 
-    if msg.audio:
-        file_size = msg.audio.file_size
-    elif msg.video:
-        file_size = msg.video.file_size
-    elif msg.document:
-        file_size = msg.document.file_size
-    else:
-        file_size = 0
-
-    if file_size and file_size > MAX_FILE_SIZE:
-        size_mb = file_size / (1024*1024)
-        await msg.reply(get_text(lang, "file_too_large", size=size_mb))
-        return
+    # محدودیت حجم فقط برای فایل‌های صوتی (ورودی)
+    if is_audio or is_document_audio:
+        file_size = msg.audio.file_size if is_audio else msg.document.file_size
+        if file_size and file_size > MAX_FILE_SIZE:
+            size_mb = file_size / (1024*1024)
+            await msg.reply(get_text(lang, "file_too_large", size=size_mb))
+            return
+    # برای ویدیوها محدودیتی در ورودی نداریم
 
     if not check_rate_limit(user_id):
         await msg.reply(get_rate_limit_message(lang))
@@ -779,24 +603,14 @@ async def handle_media(msg: types.Message, is_command: bool = False):
 
         async with group_pending_lock:
             group_pending[request_id] = {
-                "user_id": user_id,
-                "chat_id": chat_id,
-                "file_id": file_id,
-                "is_video": is_video_flag,
-                "ext": ext,
-                "message_id": msg.message_id,
-                "timestamp": time.time(),
-                "lang": lang
+                "user_id": user_id, "chat_id": chat_id, "file_id": file_id,
+                "is_video": is_video_flag, "ext": ext, "message_id": msg.message_id,
+                "timestamp": time.time(), "lang": lang
             }
-        await msg.reply(
-            get_text(lang, "group_confirm"),
-            reply_markup=group_confirm_kb(request_id, lang)
-        )
+        await msg.reply(get_text(lang, "group_confirm"), reply_markup=group_confirm_kb(request_id, lang))
         return
 
-    quality = user["quality"]
-    mono_mode = user["mono_mode"]
-
+    # حالت خصوصی یا دستور compress
     if is_audio:
         file_id = msg.audio.file_id
         is_video_flag = False
@@ -815,16 +629,10 @@ async def handle_media(msg: types.Message, is_command: bool = False):
         ext = os.path.splitext(msg.document.file_name)[1] or ".mp4"
 
     item = QueueItem(
-        user_id=user_id,
-        lang=lang,
-        file_id=file_id,
-        quality=quality,
-        mono_mode=mono_mode,
-        is_video=is_video_flag,
-        ext=ext,
-        chat_id=chat_id,
-        reply_to_message_id=msg.message_id,
-        requester_name=msg.from_user.full_name if is_group else None
+        user_id=user_id, lang=lang, file_id=file_id,
+        quality=user["quality"], mono_mode=user["mono_mode"],
+        is_video=is_video_flag, ext=ext, chat_id=chat_id,
+        reply_to_message_id=msg.message_id, requester_name=msg.from_user.full_name if is_group else None
     )
     try:
         await processing_queue.put(item)
@@ -832,17 +640,32 @@ async def handle_media(msg: types.Message, is_command: bool = False):
     except asyncio.QueueFull:
         await msg.reply("❌ سرور شلوغ است، لحظاتی دیگر تلاش کنید.")
 
+# ------------------------- Cleanup -------------------------
+def clean_orphaned_files():
+    now = time.time()
+    deleted = 0
+    for f in os.listdir(DOWNLOAD_DIR):
+        path = os.path.join(DOWNLOAD_DIR, f)
+        if os.path.isfile(path) and now - os.path.getmtime(path) > 86400:
+            try:
+                os.remove(path)
+                deleted += 1
+            except:
+                pass
+    if deleted:
+        logger.info(f"Cleaned up {deleted} orphaned files")
+
 # ------------------------- Main -------------------------
 async def main():
     clean_orphaned_files()
-    await init_db()  # ابتدا دیتابیس و جدول‌ها ساخته شوند
-    await clean_old_cache()  # سپس کش قدیمی را پاک کن (اگر جدول وجود داشته باشد)
+    await init_db()
+    await clean_old_cache()
     asyncio.create_task(cleanup_pending_requests())
-    async def periodic_cache_clean():
+    async def periodic_clean():
         while True:
             await asyncio.sleep(86400)
             await clean_old_cache()
-    asyncio.create_task(periodic_cache_clean())
+    asyncio.create_task(periodic_clean())
     workers = [asyncio.create_task(queue_worker()) for _ in range(WORKERS_COUNT)]
     await dp.start_polling(bot)
     for w in workers:
