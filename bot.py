@@ -6,6 +6,7 @@ import subprocess
 import time
 import random
 import string
+import hashlib
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -41,7 +42,7 @@ logger.info(f"FFmpeg at {FFMPEG_PATH}")
 # ------------------------- محدودیت حجم فایل -------------------------
 MAX_FILE_SIZE = 70 * 1024 * 1024  # 70 مگابایت
 
-# ------------------------- Rate Limiting (in-memory با پاکسازی خودکار) -------------------------
+# ------------------------- Rate Limiting (in-memory) -------------------------
 request_history = defaultdict(list)
 RATE_LIMIT = 5
 RATE_WINDOW = 60
@@ -60,7 +61,7 @@ def get_rate_limit_message(lang: str) -> str:
     else:
         return f"⏳ You have exceeded the rate limit ({RATE_LIMIT} files per minute). Please wait a moment."
 
-# ------------------------- Database (aiosqlite) -------------------------
+# ------------------------- Database (aiosqlite) with cache -------------------------
 async def init_db():
     async with aiosqlite.connect(DB) as conn:
         await conn.execute("""
@@ -69,6 +70,14 @@ async def init_db():
                 lang TEXT DEFAULT 'en',
                 quality TEXT DEFAULT 'medium',
                 mono_mode INTEGER DEFAULT 0
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS cache (
+                file_hash TEXT PRIMARY KEY,
+                output_path TEXT,
+                created_at REAL,
+                size INTEGER
             )
         """)
         await conn.commit()
@@ -104,6 +113,45 @@ async def update_user_mono(user_id: int, mono_mode: int):
         await conn.execute("UPDATE users SET mono_mode = ? WHERE user_id = ?", (mono_mode, user_id))
         await conn.commit()
 
+async def get_cached_output(file_hash: str) -> str | None:
+    async with aiosqlite.connect(DB) as conn:
+        async with conn.execute(
+            "SELECT output_path FROM cache WHERE file_hash = ?", (file_hash,)
+        ) as cur:
+            row = await cur.fetchone()
+            if row and os.path.exists(row[0]):
+                return row[0]
+            elif row:
+                # فایل وجود ندارد، رکورد خراب است
+                await conn.execute("DELETE FROM cache WHERE file_hash = ?", (file_hash,))
+                await conn.commit()
+            return None
+
+async def save_to_cache(file_hash: str, output_path: str, size: int):
+    async with aiosqlite.connect(DB) as conn:
+        await conn.execute(
+            "INSERT OR REPLACE INTO cache (file_hash, output_path, created_at, size) VALUES (?, ?, ?, ?)",
+            (file_hash, output_path, time.time(), size)
+        )
+        await conn.commit()
+
+async def clean_old_cache():
+    """حذف کش‌های قدیمی‌تر از ۷ روز و فایل‌های مربوطه"""
+    week_ago = time.time() - 7 * 86400
+    async with aiosqlite.connect(DB) as conn:
+        async with conn.execute("SELECT file_hash, output_path FROM cache WHERE created_at < ?", (week_ago,)) as cur:
+            rows = await cur.fetchall()
+            for file_hash, output_path in rows:
+                if os.path.exists(output_path):
+                    try:
+                        os.remove(output_path)
+                    except:
+                        pass
+            await conn.execute("DELETE FROM cache WHERE created_at < ?", (week_ago,))
+            await conn.commit()
+            if rows:
+                logger.info(f"Cleaned {len(rows)} old cache entries")
+
 # ------------------------- متن‌ها و کیبوردها -------------------------
 QUALITIES = {
     "low": {"bitrate": "32k", "name_fa": "خیلی کم حجم", "name_en": "Very low"},
@@ -117,7 +165,8 @@ def get_text(lang, key, **kwargs):
             "fa": "🎵 به ربات فشرده‌ساز موزیک خوش آمدید.\n\n"
                   "📀 **قابلیت‌ها:**\n"
                   "• ارسال فایل صوتی برای فشرده‌سازی\n"
-                  "• ارسال فایل ویدیویی برای استخراج صدا و فشرده‌سازی\n\n"
+                  "• ارسال فایل ویدیویی برای استخراج صدا و فشرده‌سازی\n"
+                  "• کش نتایج برای پردازش سریع‌تر فایل‌های تکراری\n\n"
                   "**دستورات:**\n"
                   "/quality - تنظیم کیفیت\n"
                   "/mono - تنظیم مونو/استریو\n"
@@ -126,7 +175,8 @@ def get_text(lang, key, **kwargs):
             "en": "🎵 Welcome to Music Compressor Bot.\n\n"
                   "📀 **Features:**\n"
                   "• Send audio file for compression\n"
-                  "• Send video file to extract audio and compress\n\n"
+                  "• Send video file to extract audio and compress\n"
+                  "• Result caching for faster repeated requests\n\n"
                   "**Commands:**\n"
                   "/quality - Set quality\n"
                   "/mono - Set mono/stereo\n"
@@ -150,23 +200,25 @@ def get_text(lang, key, **kwargs):
             "en": "Current mode: {mode}"
         },
         "about": {
-            "fa": "🤖 ربات فشرده‌ساز موزیک\nنسخه 2.6\n\n"
+            "fa": "🤖 ربات فشرده‌ساز موزیک\nنسخه 2.7\n\n"
                   "قابلیت‌ها:\n"
                   "• فشرده‌سازی فایل‌های صوتی\n"
                   "• استخراج صدا از ویدیو و فشرده‌سازی\n"
                   "• تبدیل استریو به مونو\n"
                   "• صف پردازش (مدیریت همزمان)\n"
                   "• پشتیبانی از گروه‌ها (با ادمین)\n"
-                  "• محدودیت حجم فایل: ۷۰ مگابایت\n\n"
+                  "• محدودیت حجم فایل: ۷۰ مگابایت\n"
+                  "• کش نتایج (پردازش سریع فایل‌های تکراری)\n\n"
                   "ساخته شده با aiogram 3 و FFmpeg",
-            "en": "🤖 Music Compressor Bot\nVersion 2.6\n\n"
+            "en": "🤖 Music Compressor Bot\nVersion 2.7\n\n"
                   "Features:\n"
                   "• Compress audio files\n"
                   "• Extract audio from video and compress\n"
                   "• Stereo to mono conversion\n"
                   "• Processing queue\n"
                   "• Group support (requires admin)\n"
-                  "• File size limit: 70 MB\n\n"
+                  "• File size limit: 70 MB\n"
+                  "• Result caching (fast repeated processing)\n\n"
                   "Built with aiogram 3 and FFmpeg"
         },
         "help": {
@@ -183,7 +235,8 @@ def get_text(lang, key, **kwargs):
                   "   ربات را به گروه اضافه کنید و به او نقش ادمین بدهید. سپس کاربران می‌توانند فایل ارسال کنند و با کلیک روی دکمه «فشرده‌سازی» فایل فشرده را دریافت کنند.\n\n"
                   f"📦 محدودیت حجم فایل: ۷۰ مگابایت\n"
                   f"⏳ محدودیت نرخ درخواست: {RATE_LIMIT} فایل در دقیقه\n"
-                  "🔄 صف پردازش خودکار برای مدیریت همزمان درخواست‌ها",
+                  "🔄 صف پردازش خودکار برای مدیریت همزمان درخواست‌ها\n"
+                  "💾 کش نتایج: فایل‌های تکراری سریعتر پردازش می‌شوند",
             "en": "📖 **Help:**\n\n"
                   "1️⃣ **Audio File:**\n"
                   "   Send an audio file (mp3, m4a, ogg, wav), the bot will compress it.\n\n"
@@ -197,7 +250,8 @@ def get_text(lang, key, **kwargs):
                   "   Add bot to group and give it admin rights. Then users can send files and click 'Compress' button to get compressed file.\n\n"
                   f"📦 File size limit: 70 MB\n"
                   f"⏳ Rate limit: {RATE_LIMIT} files per minute\n"
-                  "🔄 Auto queue for concurrent requests"
+                  "🔄 Auto queue for concurrent requests\n"
+                  "💾 Result caching: repeated files processed faster"
         },
         "group_not_admin": {
             "fa": "⚠️ ربات در این گروه ادمین نیست. لطفاً ابتدا ربات را ادمین کنید تا بتواند فایل‌ها را پردازش کند.",
@@ -238,6 +292,10 @@ def get_text(lang, key, **kwargs):
                   "• Alternatively, reply to the file with /compress.\n\n"
                   "Use /help for more information.\n\n"
                   "Enjoy! 🚀"
+        },
+        "cache_hit": {
+            "fa": "💾 این فایل قبلاً فشرده شده بود. ارسال از کش...",
+            "en": "💾 This file was already compressed. Sending from cache..."
         }
     }
     txt = texts.get(key, {}).get(lang, texts.get(key, {}).get("en", "Processing error"))
@@ -336,7 +394,20 @@ async def compress_audio_async(input_path, output_path, bitrate, mono_mode):
     cmd.append(output_path)
     return await run_ffmpeg(cmd, "compress_audio")
 
-# ------------------------- Processing Queue (با maxsize) -------------------------
+# ------------------------- Utility: compute MD5 hash -------------------------
+async def compute_md5(file_path: str) -> str:
+    """محاسبه هش MD5 فایل به صورت غیرمسدود (با ترد جداگانه)"""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _compute_md5_sync, file_path)
+
+def _compute_md5_sync(file_path: str) -> str:
+    hasher = hashlib.md5()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+# ------------------------- Processing Queue (با maxsize و کش) -------------------------
 @dataclass
 class QueueItem:
     user_id: int
@@ -381,37 +452,64 @@ async def process_file(item: QueueItem):
     input_path = None
     temp_audio_path = None
     output_path = None
+    audio_for_compress = None
+    cached = False
 
     try:
+        # دانلود فایل اصلی
         file = await bot.get_file(file_id)
         input_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_in{ext}")
         await bot.download_file(file.file_path, input_path)
-        await status_msg.edit_text("⏳ [🟩⬜⬜⬜⬜] 20% - " + ("دانلود شد، در حال آماده‌سازی..." if lang == "fa" else "Downloaded, preparing..."))
+        await status_msg.edit_text("⏳ [🟩⬜⬜⬜⬜] 20% - " + ("دانلود شد..." if lang == "fa" else "Downloaded..."))
 
+        # اگر ویدیو است، صدا را استخراج کن
         if is_video:
             temp_audio_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_temp_audio.mp3")
-            await status_msg.edit_text("⏳ [🟩🟩⬜⬜⬜] 40% - " + ("در حال استخراج صدا از ویدیو..." if lang == "fa" else "Extracting audio from video..."))
+            await status_msg.edit_text("⏳ [🟩🟩⬜⬜⬜] 40% - " + ("استخراج صدا..." if lang == "fa" else "Extracting audio..."))
             success = await extract_audio_from_video(input_path, temp_audio_path)
             if not success:
                 raise Exception("Audio extraction failed")
             audio_for_compress = temp_audio_path
-            await status_msg.edit_text("⏳ [🟩🟩🟩⬜⬜] 60% - " + ("صدا استخراج شد، در حال فشرده‌سازی..." if lang == "fa" else "Audio extracted, compressing..."))
         else:
             audio_for_compress = input_path
+
+        # محاسبه هش فایل صوتی (برای کش)
+        file_hash = await compute_md5(audio_for_compress)
+        cached_output = await get_cached_output(file_hash)
+
+        if cached_output:
+            # استفاده از کش
+            output_path = cached_output
+            cached = True
+            await status_msg.edit_text("⏳ [🟩🟩🟩🟩🟩] 100% - " + ("آماده ارسال (از کش)..." if lang == "fa" else "Ready from cache..."))
+            # نیازی به فشرده‌سازی نیست
+        else:
+            # فشرده‌سازی جدید
             await status_msg.edit_text("⏳ [🟩🟩🟩⬜⬜] 60% - " + ("در حال فشرده‌سازی..." if lang == "fa" else "Compressing..."))
+            output_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_out.mp3")
+            success = await compress_audio_async(audio_for_compress, output_path, bitrate, mono_mode)
+            if not success:
+                raise Exception("Compression failed")
+            # ذخیره در کش
+            new_size = os.path.getsize(output_path)
+            await save_to_cache(file_hash, output_path, new_size)
+            await status_msg.edit_text("⏳ [🟩🟩🟩🟩🟩] 100% - " + ("آماده ارسال..." if lang == "fa" else "Ready..."))
 
-        output_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_{int(datetime.now().timestamp())}_out.mp3")
-        success = await compress_audio_async(audio_for_compress, output_path, bitrate, mono_mode)
-        if not success:
-            raise Exception("Compression failed")
-
-        await status_msg.edit_text("⏳ [🟩🟩🟩🟩🟩] 100% - " + ("آماده ارسال..." if lang == "fa" else "Ready to send..."))
-
-        orig_size = os.path.getsize(audio_for_compress) / (1024*1024)
-        new_size = os.path.getsize(output_path) / (1024*1024)
-        percent = (1 - new_size/orig_size) * 100
+        # محاسبه درصد کاهش حجم
+        if cached:
+            # از کش آمد: حجم اصلی را از audio_for_compress بگیر
+            orig_size = os.path.getsize(audio_for_compress) / (1024*1024)
+            new_size = os.path.getsize(output_path) / (1024*1024)
+            percent = (1 - new_size/orig_size) * 100
+        else:
+            orig_size = os.path.getsize(audio_for_compress) / (1024*1024)
+            new_size = os.path.getsize(output_path) / (1024*1024)
+            percent = (1 - new_size/orig_size) * 100
 
         await status_msg.delete()
+
+        if cached:
+            await bot.send_message(chat_id, get_text(lang, "cache_hit"))
 
         if is_group and item.requester_name:
             result_text = get_text(lang, "group_result", name=item.requester_name, percent=percent)
@@ -421,16 +519,14 @@ async def process_file(item: QueueItem):
         await bot.send_message(chat_id, result_text)
         await bot.send_audio(chat_id, FSInputFile(output_path))
 
-        # حذف فایل خروجی بعد از ارسال
-        if output_path and os.path.exists(output_path):
-            os.remove(output_path)
-            logger.info(f"Deleted output file {output_path}")
-
+        # اگر از کش استفاده شد، فایل خروجی را حذف نکن (برای دفعات بعد نگه دار)
+        # فقط فایل‌های موقت را پاک کن
     except Exception as e:
         logger.exception(f"Processing failed for user {user_id}")
         await status_msg.delete()
         await bot.send_message(chat_id, get_text(lang, "error"))
     finally:
+        # پاکسازی فایل‌های موقت (ورودی و temp) – فایل خروجی کش را نگه دار
         for f in [input_path, temp_audio_path]:
             if f and os.path.exists(f):
                 try:
@@ -465,7 +561,7 @@ async def on_bot_chat_member_update(update: types.ChatMemberUpdated):
         await bot.send_message(chat.id, welcome_text, parse_mode="Markdown")
         logger.info(f"Sent welcome message to group {chat.id}")
 
-# ------------------------- پاکسازی فایل‌های اورفان (در استارت) -------------------------
+# ------------------------- پاکسازی فایل‌های اورفان و کش قدیمی -------------------------
 def clean_orphaned_files():
     now = time.time()
     deleted = 0
@@ -544,7 +640,7 @@ async def callback(call: types.CallbackQuery):
                 return
             group_pending.pop(request_id)
         await call.message.delete()
-        user = await get_user(user_id)  # دریافت مجدد برای اطمینان
+        user = await get_user(user_id)
         item = QueueItem(
             user_id=user_id,
             lang=req["lang"],
@@ -754,17 +850,21 @@ async def handle_media(msg: types.Message, is_command: bool = False):
 
 # ------------------------- Main -------------------------
 async def main():
-    # پاکسازی فایل‌های اورفان در استارت
+    # پاکسازی فایل‌های اورفان و کش قدیمی
     clean_orphaned_files()
-    # راه‌اندازی دیتابیس
+    await clean_old_cache()  # حذف کش‌های قدیمی از دیتابیس و فایل
     await init_db()
     # تسک پاکسازی درخواست‌های گروه
     asyncio.create_task(cleanup_pending_requests())
+    # تسک پاکسازی خودکار کش هر ۲۴ ساعت
+    async def periodic_cache_clean():
+        while True:
+            await asyncio.sleep(86400)  # 24 ساعت
+            await clean_old_cache()
+    asyncio.create_task(periodic_cache_clean())
     # کارگرهای صف
     workers = [asyncio.create_task(queue_worker()) for _ in range(WORKERS_COUNT)]
-    # استارت ربات
     await dp.start_polling(bot)
-    # در صورت خروج (معمولاً هرگز)
     for w in workers:
         w.cancel()
 
