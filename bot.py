@@ -1,6 +1,5 @@
 import os
 import asyncio
-import sqlite3
 import shutil
 import logging
 import subprocess
@@ -10,11 +9,14 @@ import string
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
+
+import aiosqlite
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, ChatMemberUpdated
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.filters import Command
 from dotenv import load_dotenv
 
+# ----------------------------- logging -----------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -39,13 +41,7 @@ logger.info(f"FFmpeg at {FFMPEG_PATH}")
 # ------------------------- محدودیت حجم فایل -------------------------
 MAX_FILE_SIZE = 70 * 1024 * 1024  # 70 مگابایت
 
-def get_file_size_limit_message(lang: str) -> str:
-    if lang == "fa":
-        return f"❌ حجم فایل ارسالی نباید بیشتر از ۷۰ مگابایت باشد. فایل شما {limit} است."
-    else:
-        return f"❌ File size cannot exceed 70 MB. Your file is {limit} MB."
-
-# ------------------------- Rate Limiting -------------------------
+# ------------------------- Rate Limiting (in-memory با پاکسازی خودکار) -------------------------
 request_history = defaultdict(list)
 RATE_LIMIT = 5
 RATE_WINDOW = 60
@@ -64,25 +60,51 @@ def get_rate_limit_message(lang: str) -> str:
     else:
         return f"⏳ You have exceeded the rate limit ({RATE_LIMIT} files per minute). Please wait a moment."
 
-# ------------------------- Database (only users) -------------------------
-def init_db():
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        lang TEXT DEFAULT 'en',
-        quality TEXT DEFAULT 'medium',
-        mono_mode INTEGER DEFAULT 0
-    )
-    """)
-    conn.commit()
-    conn.close()
+# ------------------------- Database (aiosqlite) -------------------------
+async def init_db():
+    async with aiosqlite.connect(DB) as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                lang TEXT DEFAULT 'en',
+                quality TEXT DEFAULT 'medium',
+                mono_mode INTEGER DEFAULT 0
+            )
+        """)
+        await conn.commit()
 
-init_db()
+async def get_user(user_id: int):
+    async with aiosqlite.connect(DB) as conn:
+        async with conn.execute(
+            "SELECT lang, quality, mono_mode FROM users WHERE user_id = ?", (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            if row:
+                return {"lang": row[0], "quality": row[1], "mono_mode": row[2]}
+            else:
+                await conn.execute(
+                    "INSERT INTO users (user_id, lang, quality, mono_mode) VALUES (?, ?, ?, ?)",
+                    (user_id, "en", "medium", 0)
+                )
+                await conn.commit()
+                return {"lang": "en", "quality": "medium", "mono_mode": 0}
 
-user_lang = {}
+async def update_user_lang(user_id: int, lang: str):
+    async with aiosqlite.connect(DB) as conn:
+        await conn.execute("UPDATE users SET lang = ? WHERE user_id = ?", (lang, user_id))
+        await conn.commit()
 
+async def update_user_quality(user_id: int, quality: str):
+    async with aiosqlite.connect(DB) as conn:
+        await conn.execute("UPDATE users SET quality = ? WHERE user_id = ?", (quality, user_id))
+        await conn.commit()
+
+async def update_user_mono(user_id: int, mono_mode: int):
+    async with aiosqlite.connect(DB) as conn:
+        await conn.execute("UPDATE users SET mono_mode = ? WHERE user_id = ?", (mono_mode, user_id))
+        await conn.commit()
+
+# ------------------------- متن‌ها و کیبوردها -------------------------
 QUALITIES = {
     "low": {"bitrate": "32k", "name_fa": "خیلی کم حجم", "name_en": "Very low"},
     "medium": {"bitrate": "64k", "name_fa": "معمولی", "name_en": "Medium"},
@@ -128,7 +150,7 @@ def get_text(lang, key, **kwargs):
             "en": "Current mode: {mode}"
         },
         "about": {
-            "fa": "🤖 ربات فشرده‌ساز موزیک\nنسخه 2.5\n\n"
+            "fa": "🤖 ربات فشرده‌ساز موزیک\nنسخه 2.6\n\n"
                   "قابلیت‌ها:\n"
                   "• فشرده‌سازی فایل‌های صوتی\n"
                   "• استخراج صدا از ویدیو و فشرده‌سازی\n"
@@ -137,7 +159,7 @@ def get_text(lang, key, **kwargs):
                   "• پشتیبانی از گروه‌ها (با ادمین)\n"
                   "• محدودیت حجم فایل: ۷۰ مگابایت\n\n"
                   "ساخته شده با aiogram 3 و FFmpeg",
-            "en": "🤖 Music Compressor Bot\nVersion 2.5\n\n"
+            "en": "🤖 Music Compressor Bot\nVersion 2.6\n\n"
                   "Features:\n"
                   "• Compress audio files\n"
                   "• Extract audio from video and compress\n"
@@ -221,7 +243,6 @@ def get_text(lang, key, **kwargs):
     txt = texts.get(key, {}).get(lang, texts.get(key, {}).get("en", "Processing error"))
     return txt.format(**kwargs) if kwargs else txt
 
-# ------------------------- Keyboards -------------------------
 def main_kb(lang):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🇮🇷 فارسی", callback_data="fa"),
@@ -257,38 +278,52 @@ def group_confirm_kb(request_id: str, lang: str):
         ]
     ])
 
-# ------------------------- Group pending requests -------------------------
+# ------------------------- Group pending requests (با Lock) -------------------------
 group_pending = {}
+group_pending_lock = asyncio.Lock()
 PENDING_EXPIRE_SECONDS = 300
 
 async def cleanup_pending_requests():
     while True:
-        now = time.time()
-        expired = [rid for rid, data in group_pending.items() if now - data["timestamp"] > PENDING_EXPIRE_SECONDS]
-        for rid in expired:
-            req = group_pending.pop(rid)
-            try:
-                await bot.edit_message_text(
-                    chat_id=req["chat_id"],
-                    message_id=req["message_id"],
-                    text=get_text(req["lang"], "group_expired")
-                )
-            except:
-                pass
+        try:
+            now = time.time()
+            async with group_pending_lock:
+                expired = [rid for rid, data in group_pending.items() if now - data["timestamp"] > PENDING_EXPIRE_SECONDS]
+                for rid in expired:
+                    req = group_pending.pop(rid)
+                    try:
+                        await bot.edit_message_text(
+                            chat_id=req["chat_id"],
+                            message_id=req["message_id"],
+                            text=get_text(req["lang"], "group_expired")
+                        )
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.error(f"Cleanup error: {e}")
         await asyncio.sleep(60)
 
-# ------------------------- FFmpeg helpers -------------------------
+# ------------------------- FFmpeg helpers با timeout -------------------------
 async def run_ffmpeg(cmd, step_name=""):
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE
     )
-    _, stderr = await process.communicate()
-    if process.returncode != 0:
-        logger.error(f"FFmpeg error in {step_name}: {stderr.decode()}")
+    try:
+        _, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
+        if process.returncode != 0:
+            logger.error(f"FFmpeg error in {step_name}: {stderr.decode()}")
+            return False
+        return True
+    except asyncio.TimeoutError:
+        logger.error(f"FFmpeg timeout in {step_name}")
+        process.kill()
+        await process.wait()
         return False
-    return True
+    except Exception as e:
+        logger.exception(f"FFmpeg exception in {step_name}")
+        return False
 
 async def extract_audio_from_video(video_path, audio_path):
     cmd = [FFMPEG_PATH, "-i", video_path, "-q:a", "0", "-map", "a", audio_path, "-y"]
@@ -301,7 +336,7 @@ async def compress_audio_async(input_path, output_path, bitrate, mono_mode):
     cmd.append(output_path)
     return await run_ffmpeg(cmd, "compress_audio")
 
-# ------------------------- Processing Queue -------------------------
+# ------------------------- Processing Queue (با maxsize) -------------------------
 @dataclass
 class QueueItem:
     user_id: int
@@ -315,7 +350,7 @@ class QueueItem:
     reply_to_message_id: int = None
     requester_name: str = None
 
-processing_queue = asyncio.Queue()
+processing_queue = asyncio.Queue(maxsize=100)
 WORKERS_COUNT = 3
 
 async def queue_worker():
@@ -386,6 +421,7 @@ async def process_file(item: QueueItem):
         await bot.send_message(chat_id, result_text)
         await bot.send_audio(chat_id, FSInputFile(output_path))
 
+        # حذف فایل خروجی بعد از ارسال
         if output_path and os.path.exists(output_path):
             os.remove(output_path)
             logger.info(f"Deleted output file {output_path}")
@@ -399,7 +435,7 @@ async def process_file(item: QueueItem):
             if f and os.path.exists(f):
                 try:
                     os.remove(f)
-                except:
+                except Exception:
                     pass
 
 # ------------------------- Helper: check bot admin in group -------------------------
@@ -407,192 +443,162 @@ async def is_bot_admin(chat_id: int) -> bool:
     try:
         bot_member = await bot.get_chat_member(chat_id, bot.id)
         return bot_member.status in ["administrator", "creator"]
-    except:
+    except Exception:
         return False
 
 # ------------------------- Auto welcome when bot added to group -------------------------
-# Set to keep track of groups that already received welcome (in memory, resets on restart - acceptable)
 welcomed_groups = set()
 
 @dp.my_chat_member()
 async def on_bot_chat_member_update(update: types.ChatMemberUpdated):
-    # Check if the bot was added to a group or its status changed to admin/member
     chat = update.chat
     if chat.type not in ["group", "supergroup"]:
         return
-    
-    # Check if the bot's status changed to something that allows it to send messages
-    # new_status could be "member", "administrator", or "creator"
     new_status = update.new_chat_member.status
     old_status = update.old_chat_member.status
-    
-    # If bot was just added (old_status left, new_status is member/administrator) or upgraded to admin
     if (old_status in ["left", "kicked"] and new_status in ["member", "administrator", "creator"]) or \
        (old_status == "member" and new_status == "administrator"):
-        # Avoid sending duplicate welcome message in the same session
         if chat.id in welcomed_groups:
             return
         welcomed_groups.add(chat.id)
-        
-        # Send welcome message in English (or detect group language? We'll use English for simplicity)
         welcome_text = get_text("en", "welcome_group")
         await bot.send_message(chat.id, welcome_text, parse_mode="Markdown")
         logger.info(f"Sent welcome message to group {chat.id}")
+
+# ------------------------- پاکسازی فایل‌های اورفان (در استارت) -------------------------
+def clean_orphaned_files():
+    now = time.time()
+    deleted = 0
+    for filename in os.listdir(DOWNLOAD_DIR):
+        filepath = os.path.join(DOWNLOAD_DIR, filename)
+        if os.path.isfile(filepath):
+            if now - os.path.getmtime(filepath) > 86400:  # 24 ساعت
+                try:
+                    os.remove(filepath)
+                    deleted += 1
+                except Exception:
+                    pass
+    if deleted:
+        logger.info(f"Cleaned up {deleted} orphaned files")
 
 # ------------------------- Bot Handlers -------------------------
 @dp.message(Command("start"))
 async def start(msg: types.Message):
     user_id = msg.from_user.id
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO users (user_id, lang, quality, mono_mode) VALUES (?, ?, ?, ?)",
-                (user_id, "en", "medium", 0))
-    conn.commit()
-    cur.execute("SELECT lang FROM users WHERE user_id = ?", (user_id,))
-    lang = cur.fetchone()[0]
-    conn.close()
-    user_lang[user_id] = lang
+    user = await get_user(user_id)
+    lang = user["lang"]
     await msg.answer(get_text(lang, "start"), reply_markup=main_kb(lang), parse_mode="Markdown")
 
 @dp.message(Command("quality"))
 async def quality_cmd(msg: types.Message):
     user_id = msg.from_user.id
-    lang = user_lang.get(user_id, "en")
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute("SELECT quality FROM users WHERE user_id = ?", (user_id,))
-    current = cur.fetchone()[0]
-    conn.close()
+    user = await get_user(user_id)
+    lang = user["lang"]
+    current = user["quality"]
     await msg.answer("Select quality:" if lang == "en" else "کیفیت مورد نظر را انتخاب کنید:", 
                      reply_markup=quality_kb(lang, current))
 
 @dp.message(Command("mono"))
 async def mono_cmd(msg: types.Message):
     user_id = msg.from_user.id
-    lang = user_lang.get(user_id, "en")
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute("SELECT mono_mode FROM users WHERE user_id = ?", (user_id,))
-    current = cur.fetchone()[0]
-    conn.close()
+    user = await get_user(user_id)
+    lang = user["lang"]
+    current = user["mono_mode"]
     mode_name = "مونو (Mono)" if current == 1 else "استریو (Stereo)"
     await msg.answer(get_text(lang, "mono_current", mode=mode_name), reply_markup=mono_kb(lang, current))
 
 @dp.message(Command("about"))
 async def about_cmd(msg: types.Message):
     user_id = msg.from_user.id
-    lang = user_lang.get(user_id, "en")
+    user = await get_user(user_id)
+    lang = user["lang"]
     await msg.answer(get_text(lang, "about"), reply_markup=main_kb(lang), parse_mode="Markdown")
 
 @dp.message(Command("help"))
 async def help_cmd(msg: types.Message):
     user_id = msg.from_user.id
-    lang = user_lang.get(user_id, "en")
+    user = await get_user(user_id)
+    lang = user["lang"]
     await msg.answer(get_text(lang, "help"), reply_markup=main_kb(lang), parse_mode="Markdown")
 
 @dp.callback_query()
 async def callback(call: types.CallbackQuery):
     user_id = call.from_user.id
     data = call.data
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute("SELECT lang, quality, mono_mode FROM users WHERE user_id = ?", (user_id,))
-    lang, quality, mono_mode = cur.fetchone()
-    conn.close()
-    user_lang[user_id] = lang
+    user = await get_user(user_id)
+    lang = user["lang"]
+    quality = user["quality"]
+    mono_mode = user["mono_mode"]
 
     # پردازش دکمه‌های گروه
     if data.startswith("group_compress_"):
         request_id = data.split("_")[2]
-        req = group_pending.get(request_id)
-        if not req:
-            await call.answer(get_text(lang, "group_expired"), show_alert=True)
-            await call.message.delete()
-            return
-        if req["user_id"] != user_id:
-            await call.answer("این دکمه متعلق به شما نیست.", show_alert=True)
-            return
-        group_pending.pop(request_id)
+        async with group_pending_lock:
+            req = group_pending.get(request_id)
+            if not req:
+                await call.answer(get_text(lang, "group_expired"), show_alert=True)
+                await call.message.delete()
+                return
+            if req["user_id"] != user_id:
+                await call.answer("این دکمه متعلق به شما نیست.", show_alert=True)
+                return
+            group_pending.pop(request_id)
         await call.message.delete()
-        conn2 = sqlite3.connect(DB)
-        cur2 = conn2.cursor()
-        cur2.execute("SELECT quality, mono_mode FROM users WHERE user_id = ?", (user_id,))
-        user_quality, user_mono = cur2.fetchone()
-        conn2.close()
+        user = await get_user(user_id)  # دریافت مجدد برای اطمینان
         item = QueueItem(
             user_id=user_id,
             lang=req["lang"],
             file_id=req["file_id"],
-            quality=user_quality,
-            mono_mode=user_mono,
+            quality=user["quality"],
+            mono_mode=user["mono_mode"],
             is_video=req["is_video"],
             ext=req["ext"],
             chat_id=req["chat_id"],
             reply_to_message_id=req["message_id"],
             requester_name=call.from_user.full_name
         )
-        await processing_queue.put(item)
+        try:
+            await processing_queue.put(item)
+        except asyncio.QueueFull:
+            await call.answer("صف پردازش پر است، لحظاتی دیگر تلاش کنید.", show_alert=True)
+            return
         await call.answer("درخواست شما به صف اضافه شد.", show_alert=False)
         await bot.send_message(req["chat_id"], get_text(req["lang"], "queued"), reply_to_message_id=req["message_id"])
         return
 
     elif data.startswith("group_cancel_"):
         request_id = data.split("_")[2]
-        req = group_pending.get(request_id)
-        if not req:
-            await call.answer()
-            await call.message.delete()
-            return
-        if req["user_id"] != user_id:
-            await call.answer("این دکمه متعلق به شما نیست.", show_alert=True)
-            return
-        group_pending.pop(request_id)
-        await call.message.edit_text(get_text(req["lang"], "group_canceled"))
+        async with group_pending_lock:
+            req = group_pending.get(request_id)
+            if req and req["user_id"] == user_id:
+                group_pending.pop(request_id)
+                await call.message.edit_text(get_text(req["lang"], "group_canceled"))
         await call.answer()
         return
 
     # دکمه‌های عادی
     if data in ["fa", "en"]:
-        conn = sqlite3.connect(DB)
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET lang = ? WHERE user_id = ?", (data, user_id))
-        conn.commit()
-        conn.close()
-        user_lang[user_id] = data
+        await update_user_lang(user_id, data)
         await call.message.edit_text(get_text(data, "start"), reply_markup=main_kb(data), parse_mode="Markdown")
-
     elif data == "quality_menu":
         await call.message.edit_text("Select quality:" if lang == "en" else "کیفیت مورد نظر را انتخاب کنید:", 
                                      reply_markup=quality_kb(lang, quality))
-
     elif data.startswith("quality_"):
         qid = data.split("_")[1]
         if qid in QUALITIES:
-            conn = sqlite3.connect(DB)
-            cur = conn.cursor()
-            cur.execute("UPDATE users SET quality = ? WHERE user_id = ?", (qid, user_id))
-            conn.commit()
-            conn.close()
+            await update_user_quality(user_id, qid)
             name = QUALITIES[qid]["name_fa"] if lang == "fa" else QUALITIES[qid]["name_en"]
             await call.message.edit_text(get_text(lang, "quality_set", name=name), reply_markup=main_kb(lang))
-
     elif data == "mono_menu":
         await call.message.edit_text("Select audio mode:" if lang == "en" else "حالت صدا را انتخاب کنید:",
                                      reply_markup=mono_kb(lang, mono_mode))
-
     elif data.startswith("mono_"):
         new_mode = int(data.split("_")[1])
-        conn = sqlite3.connect(DB)
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET mono_mode = ? WHERE user_id = ?", (new_mode, user_id))
-        conn.commit()
-        conn.close()
+        await update_user_mono(user_id, new_mode)
         mode_name = "مونو (Mono)" if new_mode == 1 else "استریو (Stereo)"
         await call.message.edit_text(get_text(lang, "mono_set", mode=mode_name), reply_markup=main_kb(lang))
-
     elif data == "back":
         await call.message.edit_text(get_text(lang, "start"), reply_markup=main_kb(lang), parse_mode="Markdown")
-
     elif data == "donate":
         if lang == "fa":
             donate_text = (
@@ -614,7 +620,6 @@ async def callback(call: types.CallbackQuery):
             )
         await call.message.answer(donate_text, parse_mode="MarkdownV2")
         await call.answer()
-
     await call.answer()
 
 @dp.message(Command("compress"))
@@ -625,7 +630,8 @@ async def compress_command(msg: types.Message):
                                    msg.reply_to_message.document.mime_type.startswith('video/')))):
         await handle_media(msg.reply_to_message, is_command=True)
     else:
-        lang = user_lang.get(msg.from_user.id, "en")
+        user = await get_user(msg.from_user.id)
+        lang = user["lang"]
         await msg.reply(get_text(lang, "help")[:200])
 
 @dp.message()
@@ -634,20 +640,8 @@ async def handle_media(msg: types.Message, is_command: bool = False):
     chat_id = msg.chat.id
     is_group = chat_id < 0
 
-    # تعیین زبان
-    if user_id in user_lang:
-        lang = user_lang[user_id]
-    else:
-        conn = sqlite3.connect(DB)
-        cur = conn.cursor()
-        cur.execute("SELECT lang FROM users WHERE user_id = ?", (user_id,))
-        row = cur.fetchone()
-        if row:
-            lang = row[0]
-        else:
-            lang = "en"
-        conn.close()
-        user_lang[user_id] = lang
+    user = await get_user(user_id)
+    lang = user["lang"]
 
     # تشخیص نوع رسانه
     is_audio = msg.audio is not None
@@ -702,28 +696,26 @@ async def handle_media(msg: types.Message, is_command: bool = False):
             is_video_flag = True
             ext = os.path.splitext(msg.document.file_name)[1] or ".mp4"
 
-        group_pending[request_id] = {
-            "user_id": user_id,
-            "chat_id": chat_id,
-            "file_id": file_id,
-            "is_video": is_video_flag,
-            "ext": ext,
-            "message_id": msg.message_id,
-            "timestamp": time.time(),
-            "lang": lang
-        }
-        confirm_msg = await msg.reply(
+        async with group_pending_lock:
+            group_pending[request_id] = {
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "file_id": file_id,
+                "is_video": is_video_flag,
+                "ext": ext,
+                "message_id": msg.message_id,
+                "timestamp": time.time(),
+                "lang": lang
+            }
+        await msg.reply(
             get_text(lang, "group_confirm"),
             reply_markup=group_confirm_kb(request_id, lang)
         )
         return
 
     # حالت خصوصی یا دستور /compress در گروه
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute("SELECT quality, mono_mode FROM users WHERE user_id = ?", (user_id,))
-    quality, mono_mode = cur.fetchone()
-    conn.close()
+    quality = user["quality"]
+    mono_mode = user["mono_mode"]
 
     if is_audio:
         file_id = msg.audio.file_id
@@ -754,14 +746,25 @@ async def handle_media(msg: types.Message, is_command: bool = False):
         reply_to_message_id=msg.message_id,
         requester_name=msg.from_user.full_name if is_group else None
     )
-    await processing_queue.put(item)
-    await msg.reply(get_text(lang, "queued"))
+    try:
+        await processing_queue.put(item)
+        await msg.reply(get_text(lang, "queued"))
+    except asyncio.QueueFull:
+        await msg.reply("❌ سرور شلوغ است، لحظاتی دیگر تلاش کنید.")
 
 # ------------------------- Main -------------------------
 async def main():
+    # پاکسازی فایل‌های اورفان در استارت
+    clean_orphaned_files()
+    # راه‌اندازی دیتابیس
+    await init_db()
+    # تسک پاکسازی درخواست‌های گروه
     asyncio.create_task(cleanup_pending_requests())
+    # کارگرهای صف
     workers = [asyncio.create_task(queue_worker()) for _ in range(WORKERS_COUNT)]
+    # استارت ربات
     await dp.start_polling(bot)
+    # در صورت خروج (معمولاً هرگز)
     for w in workers:
         w.cancel()
 
